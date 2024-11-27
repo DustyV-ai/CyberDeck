@@ -1,0 +1,62 @@
+# Function to get registry value
+function Get-RegistryValue {
+    param (
+        [string]$Path,
+        [string]$Name
+    )
+    try {
+        return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name
+    }
+    catch {
+        return $null
+    }
+}
+
+# Check LLMNR status
+$llmnrPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+$llmnrValue = Get-RegistryValue -Path $llmnrPath -Name "EnableMulticast"
+$llmnrEnabled = if ($null -eq $llmnrValue) { $true } else { $llmnrValue -eq 1 }
+
+# Check mDNS status
+$mdnsPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters"
+$mdnsValue = Get-RegistryValue -Path $mdnsPath -Name "EnableMDNS"
+$mdnsEnabled = if ($null -eq $mdnsValue) { $false } else { $mdnsValue -eq 1 }
+
+# Check NetBIOS status
+$netbiosPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters"
+$netbiosValue = Get-RegistryValue -Path $netbiosPath -Name "NetbiosOptions"
+$netbiosStatus = switch ($netbiosValue) {
+    0 { "Default" }
+    1 { "Enabled" }
+    2 { "Disabled" }
+    default { "Unknown" }
+}
+
+# Store the information in a hashtable
+$nameResolutionInfo = @{
+    LLMNREnabled = $llmnrEnabled
+    MDNSEnabled = $mdnsEnabled
+    NetBIOSStatus = $netbiosStatus
+}
+
+# Example of how to use the stored data
+foreach ($key in $nameResolutionInfo.Keys) {
+    Write-Host "$key : $($nameResolutionInfo[$key])"
+}
+
+# Additional check for NetBIOS over TCP/IP on each network adapter
+$adapters = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
+$adapterNetBIOSStatus = @{}
+
+foreach ($adapter in $adapters) {
+    $adapterNetBIOSStatus[$adapter.Description] = if ($adapter.TcpipNetbiosOptions -eq 2) { "Disabled" } else { "Enabled" }
+}
+
+# Add adapter-specific NetBIOS status to the main hashtable
+$nameResolutionInfo.AdapterNetBIOSStatus = $adapterNetBIOSStatus
+
+# Example of how to display adapter-specific NetBIOS status
+Write-Host "`nNetBIOS status for each network adapter:"
+foreach ($adapter in $adapterNetBIOSStatus.Keys) {
+    Write-Host "$adapter : $($adapterNetBIOSStatus[$adapter])"
+}
