@@ -1,0 +1,70 @@
+# Ensure we're running as administrator
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Warning "Please run this script as an Administrator!"
+    Exit
+}
+
+# Function to check for pending reboot
+function Test-PendingReboot {
+    if (Get-ChildItem "HKLM:\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" -EA Ignore) { return $true }
+    if (Get-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -EA Ignore) { return $true }
+    if (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -EA Ignore) { return $true }
+    try { 
+        $util = [wmiclass]"\\.\root\ccm\clientsdk:CCM_ClientUtilities"
+        $status = $util.DetermineIfRebootPending()
+        if (($status -ne $null) -and $status.RebootPending) {
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
+# Check Windows Update status
+$updateSession = New-Object -ComObject Microsoft.Update.Session
+$updateSearcher = $updateSession.CreateUpdateSearcher()
+
+try {
+    $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+    
+    $pendingUpdatesCount = $searchResult.Updates.Count
+    $pendingUpdatesInfo = $searchResult.Updates | ForEach-Object { $_.Title }
+
+    $isUpToDate = $pendingUpdatesCount -eq 0
+} catch {
+    Write-Warning "Failed to check for Windows updates: $_"
+    $isUpToDate = $null
+    $pendingUpdatesCount = $null
+    $pendingUpdatesInfo = $null
+}
+
+# Check for pending reboot
+$pendingReboot = Test-PendingReboot
+
+# Check update history for failures
+$updateHistory = $updateSearcher.GetTotalHistoryCount()
+$failedUpdates = @($updateSearcher.QueryHistory(0, $updateHistory) | Where-Object { $_.ResultCode -eq 4 }) # 4 is the code for failed updates
+
+# Store information in a hashtable
+$updateInfo = @{
+    IsUpToDate = $isUpToDate
+    PendingUpdatesCount = $pendingUpdatesCount
+    PendingUpdatesInfo = $pendingUpdatesInfo
+    PendingReboot = $pendingReboot
+    FailedUpdatesCount = $failedUpdates.Count
+    FailedUpdatesInfo = $failedUpdates | ForEach-Object { $_.Title }
+}
+
+# Example of how to use the stored data
+Write-Host "Windows Update Status:"
+Write-Host "Up to Date: $($updateInfo.IsUpToDate)"
+Write-Host "Pending Updates: $($updateInfo.PendingUpdatesCount)"
+if ($updateInfo.PendingUpdatesCount -gt 0) {
+    Write-Host "Pending Updates Info:"
+    $updateInfo.PendingUpdatesInfo | ForEach-Object { Write-Host "- $_" }
+}
+Write-Host "Pending Reboot: $($updateInfo.PendingReboot)"
+Write-Host "Failed Updates: $($updateInfo.FailedUpdatesCount)"
+if ($updateInfo.FailedUpdatesCount -gt 0) {
+    Write-Host "Failed Updates Info:"
+    $updateInfo.FailedUpdatesInfo | ForEach-Object { Write-Host "- $_" }
+}
