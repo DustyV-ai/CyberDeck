@@ -1,0 +1,56 @@
+# Function to check if a specific TLS version is enabled
+function Get-TLSStatus {
+    param (
+        [string]$ProtocolName,
+        [string]$ClientKeyPath,
+        [string]$ServerKeyPath
+    )
+
+    $clientKey = Get-ItemProperty -Path $ClientKeyPath -Name "Enabled" -ErrorAction SilentlyContinue
+    $serverKey = Get-ItemProperty -Path $ServerKeyPath -Name "Enabled" -ErrorAction SilentlyContinue
+
+    $clientEnabled = if ($clientKey) { $clientKey.Enabled -eq 1 } else { $false }
+    $serverEnabled = if ($serverKey) { $serverKey.Enabled -eq 1 } else { $false }
+
+    return @{
+        Protocol = $ProtocolName
+        ClientEnabled = $clientEnabled
+        ServerEnabled = $serverEnabled
+    }
+}
+
+# Registry paths
+$baseKey = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols"
+
+# Get TLS status for different versions
+$tls10Status = Get-TLSStatus -ProtocolName "TLS 1.0" `
+    -ClientKeyPath "$baseKey\TLS 1.0\Client" `
+    -ServerKeyPath "$baseKey\TLS 1.0\Server"
+
+$tls11Status = Get-TLSStatus -ProtocolName "TLS 1.1" `
+    -ClientKeyPath "$baseKey\TLS 1.1\Client" `
+    -ServerKeyPath "$baseKey\TLS 1.1\Server"
+
+$tls12Status = Get-TLSStatus -ProtocolName "TLS 1.2" `
+    -ClientKeyPath "$baseKey\TLS 1.2\Client" `
+    -ServerKeyPath "$baseKey\TLS 1.2\Server"
+
+$tls13Status = Get-TLSStatus -ProtocolName "TLS 1.3" `
+    -ClientKeyPath "$baseKey\TLS 1.3\Client" `
+    -ServerKeyPath "$baseKey\TLS 1.3\Server"
+
+# Store TLS status in variables
+$tlsStatus = @(
+    $tls10Status,
+    $tls11Status,
+    $tls12Status,
+    $tls13Status
+)
+
+# Example of how to use the stored data
+foreach ($status in $tlsStatus) {
+    Write-Host "Protocol: $($status.Protocol)"
+    Write-Host "  Client Enabled: $($status.ClientEnabled)"
+    Write-Host "  Server Enabled: $($status.ServerEnabled)"
+    Write-Host ""
+}
