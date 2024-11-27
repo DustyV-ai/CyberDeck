@@ -1,0 +1,60 @@
+# Function to get registry value
+function Get-RegistryValue {
+    param (
+        [string]$Path,
+        [string]$Name
+    )
+    try {
+        return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name
+    }
+    catch {
+        return $null
+    }
+}
+
+# SMB Version Status
+$smbv1Enabled = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol).State -eq "Enabled"
+$smbv2Enabled = !(Get-SmbServerConfiguration).DisableSMB2Protocol
+$smbv3Enabled = $smbv2Enabled  # SMBv3 is part of SMBv2 in terms of enable/disable
+
+# Null Session Authentication
+$nullSessionPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+$nullSessionValue = Get-RegistryValue -Path $nullSessionPath -Name "RestrictAnonymous"
+$nullSessionEnabled = $nullSessionValue -eq 0
+
+# SMB Encryption
+$smbEncryption = (Get-SmbServerConfiguration).EncryptData
+
+# SMB Signing
+$smbSigningRequired = (Get-SmbServerConfiguration).RequireSecuritySignature
+
+# SMB Direct (RDMA)
+$smbDirectEnabled = (Get-SmbServerConfiguration).EnableSMBDirect
+
+# Insecure Guest Logons
+$insecureGuestLogonsEnabled = (Get-SmbServerConfiguration).EnableInsecureGuestLogons
+
+# Server-side Copy Offload
+$copyOffloadEnabled = (Get-SmbServerConfiguration).EnableSMBServerCopyOffload
+
+# Multichannel
+$multichannelEnabled = (Get-SmbServerConfiguration).EnableMultiChannel
+
+# Store all information in a hashtable
+$smbInfo = @{
+    SMBv1Enabled = $smbv1Enabled
+    SMBv2Enabled = $smbv2Enabled
+    SMBv3Enabled = $smbv3Enabled
+    NullSessionEnabled = $nullSessionEnabled
+    SMBEncryptionEnabled = $smbEncryption
+    SMBSigningRequired = $smbSigningRequired
+    SMBDirectEnabled = $smbDirectEnabled
+    InsecureGuestLogonsEnabled = $insecureGuestLogonsEnabled
+    ServerSideCopyOffloadEnabled = $copyOffloadEnabled
+    MultichannelEnabled = $multichannelEnabled
+}
+
+# Example of how to use the stored data
+foreach ($key in $smbInfo.Keys) {
+    Write-Host "$key : $($smbInfo[$key])"
+}
