@@ -1,0 +1,153 @@
+function Check-StartupPrograms {
+    $startupLocations = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+
+    $suspiciousPrograms = @()
+
+    foreach ($location in $startupLocations) {
+        if (Test-Path $location) {
+            $items = Get-ItemProperty -Path $location
+            $items.PSObject.Properties | Where-Object { $_.Name -notin @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider") } | ForEach-Object {
+                $suspiciousPrograms += [PSCustomObject]@{
+                    Location = $location
+                    Name = $_.Name
+                    Value = $_.Value
+                }
+            }
+        }
+    }
+
+    return $suspiciousPrograms
+}
+
+function Get-ParentProcess {
+    param (
+        [Parameter(Mandatory=$true)]
+        [int]$ProcessId
+    )
+
+    $parentProcess = Get-WmiObject Win32_Process -Filter "ProcessId = $ProcessId"
+    if ($parentProcess.ParentProcessId) {
+        $parent = Get-Process -Id $parentProcess.ParentProcessId -ErrorAction SilentlyContinue
+        if ($parent) {
+            return [PSCustomObject]@{
+                Name = $parent.ProcessName
+                ID = $parent.Id
+            }
+        }
+    }
+    return $null
+}
+
+function Check-RunningProcesses {
+    $suspiciousProcesses = @()
+    Get-Process | Where-Object { $_.ProcessName -match "keylog" -or $_.ProcessName -match "hook" } | ForEach-Object {
+        $parent = Get-ParentProcess -ProcessId $_.Id
+        $suspiciousProcesses += [PSCustomObject]@{
+            Name = $_.ProcessName
+            ID = $_.Id
+            ParentName = if ($parent) { $parent.Name } else { "N/A" }
+            ParentID = if ($parent) { $parent.ID } else { "N/A" }
+        }
+    }
+    return $suspiciousProcesses
+}
+
+function Check-KeyboardHooks {
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Runtime.InteropServices;
+
+    public class Win32 {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", SetLastError=true)]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    }
+"@
+
+    $hookedWindows = @()
+    $foregroundWindow = [Win32]::GetForegroundWindow()
+    $processId = 0
+    [Win32]::GetWindowThreadProcessId($foregroundWindow, [ref]$processId)
+    
+    try {
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        $parent = Get-ParentProcess -ProcessId $process.Id
+        $hookedWindows += [PSCustomObject]@{
+            Name = $process.ProcessName
+            ID = $process.Id
+            ParentName = if ($parent) { $parent.Name } else { "N/A" }
+            ParentID = if ($parent) { $parent.ID } else { "N/A" }
+        }
+    } catch {
+        Write-Host "Unable to access process with ID $processId. It might have terminated or access is denied."
+    }
+
+    Get-Process | ForEach-Object {
+        try {
+            $modules = $_.Modules
+            foreach ($module in $modules) {
+                if ($module.ModuleName -match "hook" -or $module.FileName -match "hook") {
+                    $parent = Get-ParentProcess -ProcessId $_.Id
+                    $hookedWindows += [PSCustomObject]@{
+                        Name = $_.ProcessName
+                        ID = $_.Id
+                        ParentName = if ($parent) { $parent.Name } else { "N/A" }
+                        ParentID = if ($parent) { $parent.ID } else { "N/A" }
+                        SuspiciousModule = $module.ModuleName
+                    }
+                    break
+                }
+            }
+        } catch {
+            Write-Host "Unable to access modules for process $($_.ProcessName) (ID: $($_.Id)). It might have terminated or access is denied."
+        }
+    }
+
+    return $hookedWindows
+}
+
+function Main {
+    Write-Host "Checking for potential keyloggers..."
+
+    $startupPrograms = Check-StartupPrograms
+    Write-Host "`nSuspicious startup programs:"
+    if ($startupPrograms.Count -eq 0) {
+        Write-Host "No suspicious startup programs found."
+    } else {
+        $startupPrograms | Format-Table Location, Name, Value -AutoSize
+    }
+
+    $runningProcesses = Check-RunningProcesses
+    Write-Host "`nSuspicious running processes:"
+    if ($runningProcesses.Count -eq 0) {
+        Write-Host "No suspicious processes found."
+    } else {
+        $runningProcesses | Format-Table -AutoSize
+    }
+
+    $hookedWindows = Check-KeyboardHooks
+    Write-Host "`nProcesses with potential keyboard hooks:"
+    if ($hookedWindows.Count -eq 0) {
+        Write-Host "No processes with potential keyboard hooks found."
+    } else {
+        $hookedWindows | ForEach-Object {
+            if (-not $_.Name) {
+                Write-Host "Process ID $($_.ID) - Unable to retrieve process name"
+            }
+        }
+        $hookedWindows | Where-Object { $_.Name } | Format-Table Name, ID, ParentName, ParentID, SuspiciousModule -AutoSize
+    }
+
+    Write-Host "`nNote: This script provides a basic check and may produce false positives."
+    Write-Host "For a thorough analysis, consider using specialized anti-malware software."
+}
+
+# Run the main function
+Main
