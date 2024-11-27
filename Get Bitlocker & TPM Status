@@ -6,23 +6,37 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 # Function to get BitLocker status for a drive
 function Get-BitLockerStatus($Drive) {
-    $bitlockerVolume = Get-BitLockerVolume -MountPoint $Drive.DriveLetter -ErrorAction SilentlyContinue
-    if ($bitlockerVolume.ProtectionStatus -eq "On") {
-        return @{
-            Enabled = $true
-            EncryptionMethod = $bitlockerVolume.EncryptionMethod
-            AuthType = ($bitlockerVolume.KeyProtector | ForEach-Object { $_.KeyProtectorType }) -join ", "
+    # Try to get BitLocker volume information
+    try {
+        $bitlockerVolume = Get-BitLockerVolume -MountPoint $Drive.DriveLetter -ErrorAction Stop
+        
+        # Check if BitLocker is enabled
+        if ($bitlockerVolume.ProtectionStatus -eq "On") {
+            return @{
+                Enabled = $true
+                EncryptionMethod = $bitlockerVolume.EncryptionMethod
+                # Join all key protector types into a single string
+                AuthType = ($bitlockerVolume.KeyProtector | ForEach-Object { $_.KeyProtectorType }) -join ", "
+            }
+        } else {
+            return @{
+                Enabled = $false
+                EncryptionMethod = $null
+                AuthType = $null
+            }
         }
-    } else {
+    } catch {
+        Write-Warning "Failed to get BitLocker status for drive $($Drive.DriveLetter): $_"
         return @{
             Enabled = $false
             EncryptionMethod = $null
             AuthType = $null
+            Error = $_.Exception.Message
         }
     }
 }
 
-# Get TPM Information
+# Initialize TPM Information hashtable
 $tpmInfo = @{
     Present = $false
     Ready = $false
@@ -30,12 +44,15 @@ $tpmInfo = @{
     Activated = $false
     Owned = $false
     Version = $null
+    Error = $null
 }
 
+# Try to get TPM information
 try {
     $tpm = Get-WmiObject -Namespace root\cimv2\security\microsofttpm -Class Win32_Tpm -ErrorAction Stop
     if ($tpm) {
         $tpmInfo.Present = $true
+        # Check TPM status using WMI methods
         $tpmInfo.Ready = ($tpm.IsReady().IsReady -eq $true)
         $tpmInfo.Enabled = ($tpm.IsEnabled().IsEnabled -eq $true)
         $tpmInfo.Activated = ($tpm.IsActivated().IsActivated -eq $true)
@@ -43,7 +60,20 @@ try {
         $tpmInfo.Version = $tpm.SpecVersion
     }
 } catch {
+    $tpmInfo.Error = $_.Exception.Message
     Write-Warning "Failed to retrieve TPM information: $_"
+}
+
+# Get BitLocker Information
+$bitlockerInfo = @{}
+try {
+    # Get all fixed drives
+    $drives = Get-Volume | Where-Object { $_.DriveLetter -ne $null -and $_.DriveType -eq 'Fixed' }
+    foreach ($drive in $drives) {
+        $bitlockerInfo[$drive.DriveLetter] = Get-BitLockerStatus $drive
+    }
+} catch {
+    Write-Warning "Failed to retrieve drive information: $_"
 }
 
 # Store all information in a hashtable
@@ -52,7 +82,7 @@ $securityInfo = @{
     BitLocker = $bitlockerInfo
 }
 
-# Example of how to use the stored data
+# Display TPM Information
 Write-Host "TPM Information:"
 Write-Host "Present: $($securityInfo.TPM.Present)"
 if ($securityInfo.TPM.Present) {
@@ -64,13 +94,24 @@ if ($securityInfo.TPM.Present) {
 } else {
     Write-Host "TPM is not present or not recognized by the system."
 }
+if ($securityInfo.TPM.Error) {
+    Write-Host "Error: $($securityInfo.TPM.Error)"
+}
 
+# Display BitLocker Information
 Write-Host "`nBitLocker Information:"
-foreach ($drive in $securityInfo.BitLocker.Keys) {
-    Write-Host "Drive $drive :"
-    Write-Host "  Enabled: $($securityInfo.BitLocker[$drive].Enabled)"
-    if ($securityInfo.BitLocker[$drive].Enabled) {
-        Write-Host "  Encryption Method: $($securityInfo.BitLocker[$drive].EncryptionMethod)"
-        Write-Host "  Authentication Type: $($securityInfo.BitLocker[$drive].AuthType)"
+if ($securityInfo.BitLocker.Count -eq 0) {
+    Write-Host "No drives found or unable to retrieve BitLocker information."
+} else {
+    foreach ($drive in $securityInfo.BitLocker.Keys) {
+        Write-Host "Drive $drive :"
+        Write-Host "  Enabled: $($securityInfo.BitLocker[$drive].Enabled)"
+        if ($securityInfo.BitLocker[$drive].Enabled) {
+            Write-Host "  Encryption Method: $($securityInfo.BitLocker[$drive].EncryptionMethod)"
+            Write-Host "  Authentication Type: $($securityInfo.BitLocker[$drive].AuthType)"
+        }
+        if ($securityInfo.BitLocker[$drive].Error) {
+            Write-Host "  Error: $($securityInfo.BitLocker[$drive].Error)"
+        }
     }
 }
