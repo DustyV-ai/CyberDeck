@@ -1,0 +1,76 @@
+# Ensure we're running as administrator
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Warning "Please run this script as an Administrator!"
+    Exit
+}
+
+# Function to get BitLocker status for a drive
+function Get-BitLockerStatus($Drive) {
+    $bitlockerVolume = Get-BitLockerVolume -MountPoint $Drive.DriveLetter -ErrorAction SilentlyContinue
+    if ($bitlockerVolume.ProtectionStatus -eq "On") {
+        return @{
+            Enabled = $true
+            EncryptionMethod = $bitlockerVolume.EncryptionMethod
+            AuthType = ($bitlockerVolume.KeyProtector | ForEach-Object { $_.KeyProtectorType }) -join ", "
+        }
+    } else {
+        return @{
+            Enabled = $false
+            EncryptionMethod = $null
+            AuthType = $null
+        }
+    }
+}
+
+# Get TPM Information
+$tpmInfo = @{
+    Present = $false
+    Ready = $false
+    Enabled = $false
+    Activated = $false
+    Owned = $false
+    Version = $null
+}
+
+try {
+    $tpm = Get-WmiObject -Namespace root\cimv2\security\microsofttpm -Class Win32_Tpm -ErrorAction Stop
+    if ($tpm) {
+        $tpmInfo.Present = $true
+        $tpmInfo.Ready = ($tpm.IsReady().IsReady -eq $true)
+        $tpmInfo.Enabled = ($tpm.IsEnabled().IsEnabled -eq $true)
+        $tpmInfo.Activated = ($tpm.IsActivated().IsActivated -eq $true)
+        $tpmInfo.Owned = ($tpm.IsOwned().IsOwned -eq $true)
+        $tpmInfo.Version = $tpm.SpecVersion
+    }
+} catch {
+    Write-Warning "Failed to retrieve TPM information: $_"
+}
+
+# Store all information in a hashtable
+$securityInfo = @{
+    TPM = $tpmInfo
+    BitLocker = $bitlockerInfo
+}
+
+# Example of how to use the stored data
+Write-Host "TPM Information:"
+Write-Host "Present: $($securityInfo.TPM.Present)"
+if ($securityInfo.TPM.Present) {
+    Write-Host "Ready: $($securityInfo.TPM.Ready)"
+    Write-Host "Enabled: $($securityInfo.TPM.Enabled)"
+    Write-Host "Activated: $($securityInfo.TPM.Activated)"
+    Write-Host "Owned: $($securityInfo.TPM.Owned)"
+    Write-Host "Version: $($securityInfo.TPM.Version)"
+} else {
+    Write-Host "TPM is not present or not recognized by the system."
+}
+
+Write-Host "`nBitLocker Information:"
+foreach ($drive in $securityInfo.BitLocker.Keys) {
+    Write-Host "Drive $drive :"
+    Write-Host "  Enabled: $($securityInfo.BitLocker[$drive].Enabled)"
+    if ($securityInfo.BitLocker[$drive].Enabled) {
+        Write-Host "  Encryption Method: $($securityInfo.BitLocker[$drive].EncryptionMethod)"
+        Write-Host "  Authentication Type: $($securityInfo.BitLocker[$drive].AuthType)"
+    }
+}
