@@ -36,7 +36,7 @@ $netbiosStatus = switch ($netbiosValue) {
 $nameResolutionInfo = @{
     LLMNREnabled = $llmnrEnabled
     MDNSEnabled = $mdnsEnabled
-    NetBIOSStatus = $netbiosStatus
+    GlobalNetBIOSStatus = $netbiosStatus
 }
 
 # Example of how to use the stored data
