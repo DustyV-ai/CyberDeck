@@ -13,7 +13,6 @@ function Check-StartupPrograms {
             $items = Get-ItemProperty -Path $location
             $items.PSObject.Properties | Where-Object { $_.Name -notin @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider") } | ForEach-Object {
                 $suspiciousPrograms += [PSCustomObject]@{
-                    Location = $location
                     Name = $_.Name
                     Value = $_.Value
                 }
@@ -86,7 +85,13 @@ function Check-KeyboardHooks {
             ParentID = if ($parent) { $parent.ID } else { "N/A" }
         }
     } catch {
-        Write-Host "Unable to access process with ID $processId. It might have terminated or access is denied."
+        $hookedWindows += [PSCustomObject]@{
+            Name = "Unknown"
+            ID = $processId
+            ParentName = "N/A"
+            ParentID = "N/A"
+            Error = "Unable to access process. It might have terminated or access is denied."
+        }
     }
 
     Get-Process | ForEach-Object {
@@ -106,7 +111,13 @@ function Check-KeyboardHooks {
                 }
             }
         } catch {
-            Write-Host "Unable to access modules for process $($_.ProcessName) (ID: $($_.Id)). It might have terminated or access is denied."
+            $hookedWindows += [PSCustomObject]@{
+                Name = $_.ProcessName
+                ID = $_.Id
+                ParentName = "N/A"
+                ParentID = "N/A"
+                Error = "Unable to access modules. It might have terminated or access is denied."
+            }
         }
     }
 
@@ -121,7 +132,7 @@ function Main {
     if ($startupPrograms.Count -eq 0) {
         Write-Host "No suspicious startup programs found."
     } else {
-        $startupPrograms | Format-Table Location, Name, Value -AutoSize
+        $startupPrograms | Format-Table Name, Value -AutoSize
     }
 
     $runningProcesses = Check-RunningProcesses
@@ -138,11 +149,11 @@ function Main {
         Write-Host "No processes with potential keyboard hooks found."
     } else {
         $hookedWindows | ForEach-Object {
-            if (-not $_.Name) {
-                Write-Host "Process ID $($_.ID) - Unable to retrieve process name"
+            if ($_.Error) {
+                Write-Host "Process ID $($_.ID) - $($_.Error)"
             }
         }
-        $hookedWindows | Where-Object { $_.Name } | Format-Table Name, ID, ParentName, ParentID, SuspiciousModule -AutoSize
+        $hookedWindows | Where-Object { -not $_.Error } | Format-Table Name, ID, ParentName, ParentID, SuspiciousModule -AutoSize
     }
 
     Write-Host "`nNote: This script provides a basic check and may produce false positives."
