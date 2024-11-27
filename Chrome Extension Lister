@@ -1,0 +1,165 @@
+try {
+    # Function to check if a string contains suspicious keywords
+    function Test-SuspiciousKeywords($text) {
+        $keywords = @("keylog", "keystroke", "keyboard", "input", "capture", "monitor", "spy", "track")
+        foreach ($keyword in $keywords) {
+            if ($text -match $keyword) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    # List of major 3rd party vendors
+    $majorVendors = @(
+        "Google", "Microsoft", "Adobe", "LastPass", "Grammarly", "Evernote", "Pocket", 
+        "Adblock", "uBlock", "Honey", "Zoom", "Dropbox", "Skype", "Trello"
+    )
+
+    # Get all user profiles
+    $userProfiles = Get-ChildItem "C:\Users" -Directory
+
+    # Array to store all extensions
+    $allExtensions = @()
+
+    foreach ($profile in $userProfiles) {
+        Write-Host "Processing user profile: $($profile.Name)" -ForegroundColor Cyan
+        $chromeUserData = Join-Path -Path $profile.FullName -ChildPath "AppData\Local\Google\Chrome\User Data"
+        
+        if (!(Test-Path $chromeUserData)) {
+            Write-Host "Chrome User Data folder not found for user: $($profile.Name)" -ForegroundColor Yellow
+            continue
+        }
+
+        # Check for different Chrome profiles within the user profile
+        $chromeProfiles = @("Default") + @(Get-ChildItem $chromeUserData -Directory | Where-Object { $_.Name -match "Profile \d+" } | ForEach-Object { $_.Name })
+
+        foreach ($chromeProfile in $chromeProfiles) {
+            Write-Host "Processing Chrome profile: $chromeProfile" -ForegroundColor Cyan
+            $extensionDir = Join-Path -Path $chromeUserData -ChildPath "$chromeProfile\Extensions"
+
+            if (!(Test-Path $extensionDir)) {
+                Write-Host "Extensions folder not found for profile: $chromeProfile" -ForegroundColor Yellow
+                continue
+            }
+
+            Write-Host "Checking extensions for user: $($profile.Name), Chrome profile: $chromeProfile" -ForegroundColor Cyan
+
+            # Array to store extension information for this profile
+            $extensions = @()
+
+            # Iterate through all extensions
+            Get-ChildItem $extensionDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $extId = $_.Name
+                Write-Host "Processing extension ID: $extId" -ForegroundColor DarkCyan
+                
+                $versionFolders = Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue
+                if ($versionFolders.Count -eq 0) {
+                    Write-Host "No version folders found for extension: $extId" -ForegroundColor Yellow
+                    return
+                }
+
+                $versionFolder = $versionFolders | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $manifestPath = Join-Path -Path $versionFolder.FullName -ChildPath "manifest.json"
+                
+                if (!(Test-Path $manifestPath)) {
+                    Write-Host "Manifest file not found for extension: $extId" -ForegroundColor Yellow
+                    return
+                }
+
+                try {
+                    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+                    
+                    # Check if it's a major vendor
+                    $isMajorVendor = $false
+                    foreach ($vendor in $majorVendors) {
+                        if ($manifest.name -match $vendor -or $manifest.description -match $vendor) {
+                            $isMajorVendor = $true
+                            break
+                        }
+                    }
+
+                    # Check for suspicious keywords
+                    $manifestString = $manifest | ConvertTo-Json -Depth 10
+                    $isSuspicious = Test-SuspiciousKeywords $manifestString
+
+                    $extensions += [PSCustomObject]@{
+                        UserProfile = $profile.Name
+                        ChromeProfile = $chromeProfile
+                        ExtensionId = $extId
+                        Name = $manifest.name
+                        Version = $manifest.version
+                        Description = $manifest.description
+                        Permissions = $manifest.permissions -join ", "
+                        BackgroundScripts = $manifest.background.scripts -join ", "
+                        ContentScripts = ($manifest.content_scripts | ForEach-Object { $_.js -join ", " }) -join "; "
+                        IsMajorVendor = $isMajorVendor
+                        IsSuspicious = $isSuspicious
+                    }
+                }
+                catch {
+                    Write-Host "Error processing manifest for extension: $extId" -ForegroundColor Red
+                    Write-Host $_.Exception.Message -ForegroundColor Red
+                }
+            }
+
+            $allExtensions += $extensions
+
+            # Display results for this profile
+            foreach ($ext in $extensions) {
+                Write-Host "`nName: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.Name
+                Write-Host "Version: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.Version
+                Write-Host "Extension ID: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.ExtensionId
+                Write-Host "Description: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.Description
+                Write-Host "Permissions: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.Permissions
+                Write-Host "Background Scripts: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.BackgroundScripts
+                Write-Host "Content Scripts: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.ContentScripts
+                Write-Host "Major Vendor: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.IsMajorVendor
+                Write-Host "Suspicious: " -NoNewline -ForegroundColor Yellow
+                Write-Host $ext.IsSuspicious
+                Write-Host ("-" * 80)
+            }
+        }
+    }
+
+    # Display summary of potentially malicious extensions
+    $suspiciousExtensions = $allExtensions | Where-Object { $_.IsSuspicious -eq $true }
+    if ($suspiciousExtensions.Count -gt 0) {
+        Write-Host "`nPotentially Malicious Extensions:" -ForegroundColor Red
+        foreach ($ext in $suspiciousExtensions) {
+            Write-Host "- $($ext.Name) (Version: $($ext.Version), User: $($ext.UserProfile), Chrome Profile: $($ext.ChromeProfile))" -ForegroundColor Magenta
+        }
+    }
+
+    # Display summary of extensions from major vendors
+    $majorVendorExtensions = $allExtensions | Where-Object { $_.IsMajorVendor -eq $true }
+    if ($majorVendorExtensions.Count -gt 0) {
+        Write-Host "`nExtensions from Major Vendors:" -ForegroundColor Green
+        foreach ($ext in $majorVendorExtensions) {
+            Write-Host "- $($ext.Name) (Version: $($ext.Version), User: $($ext.UserProfile), Chrome Profile: $($ext.ChromeProfile))" -ForegroundColor Cyan
+        }
+    }
+# Display summary statistics
+    Write-Host "`nSummary:" -ForegroundColor Yellow
+    Write-Host "Total Extensions: $($allExtensions.Count)"
+    Write-Host "Major Vendor Extensions: $($majorVendorExtensions.Count)"
+    Write-Host "Potentially Malicious Extensions: $($suspiciousExtensions.Count)"
+}
+catch {
+    Write-Host "An error occurred:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host "Stack Trace:" -ForegroundColor Red
+    Write-Host $_.Exception.StackTrace -ForegroundColor Red
+}
+finally {
+    Write-Host "`nPress any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
