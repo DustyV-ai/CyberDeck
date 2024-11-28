@@ -1,0 +1,154 @@
+# Function to get file details
+function Get-FileDetails($path) {
+    if ([string]::IsNullOrEmpty($path)) {
+        return [PSCustomObject]@{
+            Name = "Invalid Path"
+            Path = "N/A"
+            Size = $null
+            CreationTime = $null
+            LastWriteTime = $null
+            Version = $null
+            Company = $null
+            Hash = $null
+        }
+    }
+
+    if (Test-Path $path) {
+        $file = Get-Item $path
+        try {
+            $hash = (Get-FileHash $path -Algorithm SHA256 -ErrorAction Stop).Hash
+        } catch {
+            $hash = "Unable to calculate hash"
+        }
+        return [PSCustomObject]@{
+            Name = $file.Name
+            Path = $file.FullName
+            Size = $file.Length
+            CreationTime = $file.CreationTime
+            LastWriteTime = $file.LastWriteTime
+            Version = $file.VersionInfo.FileVersion
+            Company = $file.VersionInfo.CompanyName
+            Hash = $hash
+        }
+    } else {
+        return [PSCustomObject]@{
+            Name = "File not found"
+            Path = $path
+            Size = $null
+            CreationTime = $null
+            LastWriteTime = $null
+            Version = $null
+            Company = $null
+            Hash = $null
+        }
+    }
+}
+
+Write-Host "Gathering startup and autorun information..." -ForegroundColor Cyan
+
+# Registry Run keys
+$runKeys = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+)
+
+$registryAutoRuns = foreach ($key in $runKeys) {
+    if (Test-Path $key) {
+        Get-ItemProperty $key | 
+        Get-Member -MemberType NoteProperty | 
+        Where-Object { $_.Name -notin @('PSPath', 'PSParentPath', 'PSChildName', 'PSProvider') } |
+        ForEach-Object {
+            $value = (Get-ItemProperty $key).$($_.Name)
+            [PSCustomObject]@{
+                Type = "Registry AutoRun"
+                Location = $key
+                Name = $_.Name
+                Value = $value
+                FileDetails = Get-FileDetails ($value -split ' ')[0]
+            }
+        }
+    }
+}
+
+# Startup Folders
+$startupFolders = @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+)
+
+$folderAutoRuns = foreach ($folder in $startupFolders) {
+    if (Test-Path $folder) {
+        Get-ChildItem $folder | ForEach-Object {
+            [PSCustomObject]@{
+                Type = "Startup Folder"
+                Location = $folder
+                Name = $_.Name
+                Value = $_.FullName
+                FileDetails = Get-FileDetails $_.FullName
+            }
+        }
+    }
+}
+
+# Scheduled Tasks
+$scheduledTasks = Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' }
+$taskAutoRuns = $scheduledTasks | ForEach-Object {
+    $action = $_.Actions[0]
+    [PSCustomObject]@{
+        Type = "Scheduled Task"
+        Location = "Task Scheduler"
+        Name = $_.TaskName
+        Value = $action.Execute
+        FileDetails = Get-FileDetails ($action.Execute -replace '"', '')
+    }
+}
+
+# Windows Services
+$services = Get-WmiObject Win32_Service | Where-Object { $_.StartMode -eq 'Auto' }
+$serviceAutoRuns = $services | ForEach-Object {
+    [PSCustomObject]@{
+        Type = "Windows Service"
+        Location = "Services"
+        Name = $_.Name
+        Value = $_.PathName
+        FileDetails = Get-FileDetails (($value -split ' ')[0] -replace '"', '')
+    }
+}
+
+# Combine all autoruns
+$allAutoRuns = $registryAutoRuns + $folderAutoRuns + $taskAutoRuns + $serviceAutoRuns
+
+# Create summary
+$autoRunSummary = [PSCustomObject]@{
+    TotalAutoRuns = $allAutoRuns.Count
+    RegistryAutoRuns = ($allAutoRuns | Where-Object { $_.Type -eq 'Registry AutoRun' }).Count
+    StartupFolderItems = ($allAutoRuns | Where-Object { $_.Type -eq 'Startup Folder' }).Count
+    ScheduledTasks = ($allAutoRuns | Where-Object { $_.Type -eq 'Scheduled Task' }).Count
+    AutoStartServices = ($allAutoRuns | Where-Object { $_.Type -eq 'Windows Service' }).Count
+}
+
+Write-Host "Information gathering complete." -ForegroundColor Green
+
+# Display summary
+Write-Host "`nAutoRun Summary:" -ForegroundColor Cyan
+Write-Host "Total AutoRuns: $($autoRunSummary.TotalAutoRuns)"
+Write-Host "Registry AutoRuns: $($autoRunSummary.RegistryAutoRuns)"
+Write-Host "Startup Folder Items: $($autoRunSummary.StartupFolderItems)"
+Write-Host "Scheduled Tasks: $($autoRunSummary.ScheduledTasks)"
+Write-Host "Auto-Start Services: $($autoRunSummary.AutoStartServices)"
+
+Write-Host "`nVariables available for further use:" -ForegroundColor Cyan
+Write-Host "`$allAutoRuns - Contains all autorun items"
+Write-Host "`$registryAutoRuns - Contains registry autorun items"
+Write-Host "`$folderAutoRuns - Contains startup folder items"
+Write-Host "`$taskAutoRuns - Contains scheduled task items"
+Write-Host "`$serviceAutoRuns - Contains auto-start service items"
+Write-Host "`$autoRunSummary - Contains summary statistics"
+
+# Example of how to use these variables:
+Write-Host "`nExample: Top 5 autorun locations:" -ForegroundColor Yellow
+$allAutoRuns | Group-Object Location | Sort-Object Count -Descending | Select-Object -First 5 | Format-Table Name, Count -AutoSize
+
+Write-Host "`nScript execution complete. You can now use the variables for further analysis." -ForegroundColor Green
