@@ -1,0 +1,101 @@
+# Function to get detailed process information
+function Get-ProcessDetails($processId) {
+    try {
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        return [PSCustomObject]@{
+            Name = $process.Name
+            Path = $process.Path
+            Company = $process.Company
+            Description = $process.Description
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Name = "Unknown"
+            Path = "Unknown"
+            Company = "Unknown"
+            Description = "Unknown"
+        }
+    }
+}
+
+Write-Host "Gathering active network connections..." -ForegroundColor Cyan
+
+# Get all active TCP connections
+$tcpConnections = Get-NetTCPConnection | Where-Object State -eq 'Established'
+
+# Get all active UDP connections (listeners)
+$udpConnections = Get-NetUDPEndpoint
+
+Write-Host "Processing TCP connections..." -ForegroundColor Yellow
+
+# Process TCP connections
+$detailedTcpConnections = $tcpConnections | ForEach-Object {
+    $processDetails = Get-ProcessDetails $_.OwningProcess
+    [PSCustomObject]@{
+        Protocol = "TCP"
+        LocalAddress = $_.LocalAddress
+        LocalPort = $_.LocalPort
+        RemoteAddress = $_.RemoteAddress
+        RemotePort = $_.RemotePort
+        State = $_.State
+        ProcessId = $_.OwningProcess
+        ProcessName = $processDetails.Name
+        ProcessPath = $processDetails.Path
+        ProcessCompany = $processDetails.Company
+        ProcessDescription = $processDetails.Description
+    }
+}
+
+Write-Host "Processing UDP endpoints..." -ForegroundColor Yellow
+
+# Process UDP connections (listeners)
+$detailedUdpConnections = $udpConnections | ForEach-Object {
+    $processDetails = Get-ProcessDetails $_.OwningProcess
+    [PSCustomObject]@{
+        Protocol = "UDP"
+        LocalAddress = $_.LocalAddress
+        LocalPort = $_.LocalPort
+        RemoteAddress = "*"
+        RemotePort = "*"
+        State = "Listening"
+        ProcessId = $_.OwningProcess
+        ProcessName = $processDetails.Name
+        ProcessPath = $processDetails.Path
+        ProcessCompany = $processDetails.Company
+        ProcessDescription = $processDetails.Description
+    }
+}
+
+# Combine TCP and UDP connections
+$allConnections = $detailedTcpConnections + $detailedUdpConnections
+
+Write-Host "Network connection information gathered successfully." -ForegroundColor Green
+
+# Create summary variables
+$connectionSummary = [PSCustomObject]@{
+    TotalConnections = $allConnections.Count
+    TcpConnections = $detailedTcpConnections.Count
+    UdpConnections = $detailedUdpConnections.Count
+    UniqueProcesses = ($allConnections | Select-Object -Unique ProcessName).Count
+    UniqueRemoteAddresses = ($allConnections | Where-Object RemoteAddress -ne "*" | Select-Object -Unique RemoteAddress).Count
+}
+
+# Display summary
+Write-Host "`nConnection Summary:" -ForegroundColor Cyan
+Write-Host "Total Connections: $($connectionSummary.TotalConnections)"
+Write-Host "TCP Connections: $($connectionSummary.TcpConnections)"
+Write-Host "UDP Endpoints: $($connectionSummary.UdpConnections)"
+Write-Host "Unique Processes: $($connectionSummary.UniqueProcesses)"
+Write-Host "Unique Remote Addresses: $($connectionSummary.UniqueRemoteAddresses)"
+
+Write-Host "`nVariables available for further use:" -ForegroundColor Cyan
+Write-Host "`$allConnections - Contains all TCP and UDP connections"
+Write-Host "`$detailedTcpConnections - Contains only TCP connections"
+Write-Host "`$detailedUdpConnections - Contains only UDP endpoints"
+Write-Host "`$connectionSummary - Contains summary statistics"
+
+# Example of how to use these variables:
+Write-Host "`nExample: Top 5 processes by connection count:" -ForegroundColor Yellow
+$allConnections | Group-Object ProcessName | Sort-Object Count -Descending | Select-Object -First 5 | Format-Table Name, Count -AutoSize
+
+Write-Host "`nScript execution complete. You can now use the variables for further analysis." -ForegroundColor Green
