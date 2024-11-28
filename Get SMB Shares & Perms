@@ -1,0 +1,68 @@
+# Function to get NTFS permissions
+function Get-NTFSPermissions($path) {
+    $acl = Get-Acl -Path $path
+    $permissions = @()
+    foreach ($access in $acl.Access) {
+        $permissions += [PSCustomObject]@{
+            IdentityReference = $access.IdentityReference
+            FileSystemRights = $access.FileSystemRights
+            AccessControlType = $access.AccessControlType
+            IsInherited = $access.IsInherited
+        }
+    }
+    return $permissions
+}
+
+# Get all SMB shares
+$shares = Get-SmbShare
+
+# Initialize an array to store all share information
+$allShareInfo = @()
+
+foreach ($share in $shares) {
+    # Get share permissions
+    $sharePermissions = Get-SmbShareAccess -Name $share.Name
+
+    # Get NTFS permissions (if the path is accessible)
+    $ntfsPermissions = $null
+    if (Test-Path $share.Path) {
+        $ntfsPermissions = Get-NTFSPermissions -path $share.Path
+    }
+
+    # Create a custom object with all the information
+    $shareInfo = [PSCustomObject]@{
+        Name = $share.Name
+        Path = $share.Path
+        Description = $share.Description
+        SharePermissions = $sharePermissions
+        NTFSPermissions = $ntfsPermissions
+    }
+
+    # Add to the array
+    $allShareInfo += $shareInfo
+}
+
+# Now $allShareInfo contains all the information about shares, their permissions, and NTFS permissions
+
+# Example of how to access the information:
+foreach ($share in $allShareInfo) {
+    Write-Host "Share Name: $($share.Name)"
+    Write-Host "Path: $($share.Path)"
+    Write-Host "Description: $($share.Description)"
+    
+    Write-Host "Share Permissions:"
+    foreach ($perm in $share.SharePermissions) {
+        Write-Host "  $($perm.AccountName): $($perm.AccessRight)"
+    }
+    
+    if ($share.NTFSPermissions) {
+        Write-Host "NTFS Permissions:"
+        foreach ($perm in $share.NTFSPermissions) {
+            Write-Host "  $($perm.IdentityReference): $($perm.FileSystemRights) ($($perm.AccessControlType))"
+        }
+    } else {
+        Write-Host "NTFS Permissions: Unable to access"
+    }
+    
+    Write-Host ""
+}
