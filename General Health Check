@@ -1,0 +1,91 @@
+# Function to write colored output
+function Write-ColorOutput($ForegroundColor)
+{
+    $fc = $host.UI.RawUI.ForegroundColor
+    $host.UI.RawUI.ForegroundColor = $ForegroundColor
+    if ($args) {
+        Write-Output $args
+    }
+    else {
+        $input | Write-Output
+    }
+    $host.UI.RawUI.ForegroundColor = $fc
+}
+
+# Initialize an array to store health check results
+$healthChecks = @()
+
+# 1. Check Event Logs for Errors
+Write-Host "Checking Event Logs for Errors..." -ForegroundColor Cyan
+$recentErrors = Get-EventLog -LogName System -EntryType Error -Newest 50 | 
+                Group-Object -Property Source -NoElement | 
+                Sort-Object -Property Count -Descending
+foreach ($errorSource in $recentErrors) {
+    if ($errorSource.Count -gt 5) {
+        $latestError = Get-EventLog -LogName System -EntryType Error -Source $errorSource.Name -Newest 1
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Frequent System Errors"
+            Details = "$($errorSource.Count) recent errors from source: $($errorSource.Name)"
+            LatestErrorMessage = $latestError.Message
+            Recommendation = "Investigate the '$($errorSource.Name)' component. Check application logs, driver updates, or system stability."
+        }
+    }
+}
+
+# 2. Check Drive Health (S.M.A.R.T status)
+Write-Host "Checking Drive Health..." -ForegroundColor Cyan
+$physicalDisks = Get-PhysicalDisk | Where-Object MediaType -ne 'Unspecified'
+foreach ($disk in $physicalDisks) {
+    if ($disk.HealthStatus -ne 'Healthy') {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Drive Health Issue"
+            Details = "Drive $($disk.DeviceId) health status: $($disk.HealthStatus)"
+            Recommendation = "Backup data immediately. Consider replacing the drive. Run 'chkdsk' for further diagnostics."
+        }
+    }
+}
+
+# 3. Check Services
+Write-Host "Checking Critical Services..." -ForegroundColor Cyan
+$criticalServices = @{
+    'wuauserv' = 'Windows Update'
+    'WinDefend' = 'Windows Defender'
+    'MpsSvc' = 'Windows Firewall'
+}
+foreach ($service in $criticalServices.Keys) {
+    $serviceStatus = Get-Service -Name $service -ErrorAction SilentlyContinue
+    if ($serviceStatus.Status -ne 'Running') {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Critical Service Not Running"
+            Details = "$($criticalServices[$service]) service ($service) is not running. Current status: $($serviceStatus.Status)"
+            Recommendation = "Try starting the service manually using 'Start-Service $service'. If it fails, check the system logs for related errors. Ensure the service is not disabled in the services management console."
+        }
+    }
+}
+
+# 4. Check Network Connectivity
+Write-Host "Checking Network Connectivity..." -ForegroundColor Cyan
+$testConnection = Test-Connection -ComputerName www.google.com -Count 2 -Quiet
+if (-not $testConnection) {
+    $healthChecks += [PSCustomObject]@{
+        Issue = "Network Connectivity Problem"
+        Details = "Unable to reach www.google.com"
+        Recommendation = "Check your network adapter settings, Wi-Fi or Ethernet connection. Verify DNS settings. If on a corporate network, contact your IT support."
+    }
+}
+
+# Output Results
+Write-Host "`nSystem Health Check Results:" -ForegroundColor Yellow
+if ($healthChecks.Count -eq 0) {
+    Write-ColorOutput Green "No issues detected. System appears to be healthy."
+} else {
+    foreach ($issue in $healthChecks) {
+        Write-ColorOutput Red "Issue: $($issue.Issue)"
+        Write-Host "Details: $($issue.Details)"
+        if ($issue.LatestErrorMessage) {
+            Write-Host "Latest Error Message: $($issue.LatestErrorMessage)"
+        }
+        Write-ColorOutput Yellow "Recommendation: $($issue.Recommendation)"
+        Write-Host ""
+    }
+}
