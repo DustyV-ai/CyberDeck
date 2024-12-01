@@ -13,6 +13,19 @@ function Get-NTFSPermissions($path) {
     return $permissions
 }
 
+# Function to recursively get permissions for all subfolders and files
+function Get-RecursivePermissions($path) {
+    $items = @()
+    Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $itemPermissions = Get-NTFSPermissions -path $_.FullName
+        $items += [PSCustomObject]@{
+            Path = $_.FullName
+            Permissions = $itemPermissions
+        }
+    }
+    return $items
+}
+
 # Get all SMB shares
 $shares = Get-SmbShare
 
@@ -25,8 +38,16 @@ foreach ($share in $shares) {
 
     # Get NTFS permissions (if the path is accessible)
     $ntfsPermissions = $null
+    $subItemPermissions = $null
     if (Test-Path $share.Path) {
         $ntfsPermissions = Get-NTFSPermissions -path $share.Path
+        
+        # Prompt user for recursive search
+        $recursiveSearch = Read-Host "Do you want to perform a recursive search for $($share.Name)? (Y/N)"
+        if ($recursiveSearch -eq "Y" -or $recursiveSearch -eq "y") {
+            Write-Host "Performing recursive search. This may take a while..."
+            $subItemPermissions = Get-RecursivePermissions -path $share.Path
+        }
     }
 
     # Create a custom object with all the information
@@ -36,6 +57,7 @@ foreach ($share in $shares) {
         Description = $share.Description
         SharePermissions = $sharePermissions
         NTFSPermissions = $ntfsPermissions
+        SubItemPermissions = $subItemPermissions
     }
 
     # Add to the array
@@ -62,6 +84,16 @@ foreach ($share in $allShareInfo) {
         }
     } else {
         Write-Host "NTFS Permissions: Unable to access"
+    }
+    
+    if ($share.SubItemPermissions) {
+        Write-Host "Sub-item Permissions:"
+        foreach ($item in $share.SubItemPermissions) {
+            Write-Host "  Path: $($item.Path)"
+            foreach ($perm in $item.Permissions) {
+                Write-Host "    $($perm.IdentityReference): $($perm.FileSystemRights) ($($perm.AccessControlType))"
+            }
+        }
     }
     
     Write-Host ""
