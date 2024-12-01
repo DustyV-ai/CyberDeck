@@ -1,0 +1,111 @@
+# Function to get scheduled tasks
+function Get-AllScheduledTasks {
+    $tasks = @()
+    
+    # Get all scheduled tasks
+    $scheduledTasks = Get-ScheduledTask
+
+    foreach ($task in $scheduledTasks) {
+        # Get additional details for each task
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath
+
+        # Get action details
+        $actionDetails = $task.Actions | ForEach-Object {
+            $action = $_
+            switch ($action.GetType().Name) {
+                "CimInstance" {
+                    switch ($action.CimClass.CimClassName) {
+                        "MSFT_TaskExecAction" {
+                            @{
+                                Type = "Execute"
+                                Command = $action.Execute
+                                Arguments = $action.Arguments
+                                WorkingDirectory = $action.WorkingDirectory
+                            }
+                        }
+                        "MSFT_TaskComHandlerAction" {
+                            @{
+                                Type = "COM Handler"
+                                ClassId = $action.ClassId
+                                Data = $action.Data
+                            }
+                        }
+                        default {
+                            @{
+                                Type = "Unknown CimInstance"
+                                ClassName = $action.CimClass.CimClassName
+                                Details = $action | ConvertTo-Json -Depth 1
+                            }
+                        }
+                    }
+                }
+                default {
+                    @{
+                        Type = "Unknown"
+                        Details = $action | ConvertTo-Json -Depth 1
+                    }
+                }
+            }
+        }
+
+        # Create a custom object with task details
+        $taskObject = [PSCustomObject]@{
+            Name = $task.TaskName
+            Path = $task.TaskPath
+            State = $task.State
+            Description = $task.Description
+            Author = $task.Author
+            RunAs = $task.Principal.UserId
+            LastRunTime = $taskInfo.LastRunTime
+            LastTaskResult = $taskInfo.LastTaskResult
+            NextRunTime = $taskInfo.NextRunTime
+            NumberOfMissedRuns = $taskInfo.NumberOfMissedRuns
+            Triggers = $task.Triggers
+            Actions = $actionDetails
+        }
+
+        $tasks += $taskObject
+    }
+
+    return $tasks
+}
+
+# Get all scheduled tasks and store them in a variable
+$allTasks = Get-AllScheduledTasks
+
+# Example: Display the number of tasks found
+Write-Host "Number of scheduled tasks found: $($allTasks.Count)"
+
+# Example: Display basic information for each task, including actions
+foreach ($task in $allTasks) {
+    Write-Host "Task Name: $($task.Name)"
+    Write-Host "  Path: $($task.Path)"
+    Write-Host "  State: $($task.State)"
+    Write-Host "  Last Run Time: $($task.LastRunTime)"
+    Write-Host "  Next Run Time: $($task.NextRunTime)"
+    Write-Host "  Actions:"
+    foreach ($action in $task.Actions) {
+        Write-Host "    Type: $($action.Type)"
+        switch ($action.Type) {
+            "Execute" {
+                Write-Host "    Command: $($action.Command)"
+                Write-Host "    Arguments: $($action.Arguments)"
+                Write-Host "    Working Directory: $($action.WorkingDirectory)"
+            }
+            "COM Handler" {
+                Write-Host "    Class ID: $($action.ClassId)"
+                Write-Host "    Data: $($action.Data)"
+            }
+            "Unknown CimInstance" {
+                Write-Host "    ClassName: $($action.ClassName)"
+                Write-Host "    Details: $($action.Details)"
+            }
+            default {
+                Write-Host "    Details: $($action.Details)"
+            }
+        }
+    }
+    Write-Host ""
+}
+
+# Now $allTasks contains all the scheduled task information, including actions, for later use
