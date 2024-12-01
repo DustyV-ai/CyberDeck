@@ -1,0 +1,206 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import requests
+
+# Function to get organization names dynamically from the Meraki API
+def fetch_organizations(api_key):
+    url = "https://api.meraki.com/api/v1/organizations"
+    headers = {"X-Cisco-Meraki-API-Key": api_key}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception("Error fetching organizations: {}".format(response.text))
+
+# Function to get available permissions dynamically from the Meraki API
+def fetch_permissions(api_key):
+    url = "https://api.meraki.com/api/v1/roles"
+    headers = {"X-Cisco-Meraki-API-Key": api_key}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception("Error fetching permissions: {}".format(response.text))
+
+# Function to create a new Meraki user via the Meraki API
+def create_user(api_key, organization_id, username, permission_level):
+    url = f"https://api.meraki.com/api/v1/organizations/{organization_id}/admins"
+    headers = {
+        "X-Cisco-Meraki-API-Key": api_key,
+        "Content-Type": "application/json"
+    }
+    data = {
+        "email": username,
+        "role": permission_level
+    }
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 201:
+        return True
+    else:
+        return False, response.text
+
+# Function to remove a Meraki user via the Meraki API
+def remove_user(api_key, organization_id, admin_id):
+    url = f"https://api.meraki.com/api/v1/organizations/{organization_id}/admins/{admin_id}"
+    headers = {
+        "X-Cisco-Meraki-API-Key": api_key,
+    }
+    response = requests.delete(url, headers=headers)
+    if response.status_code == 204:
+        return True
+    else:
+        return False, response.text
+
+# Function to fetch admins for an organization
+def fetch_admins(api_key, organization_id):
+    url = f"https://api.meraki.com/api/v1/organizations/{organization_id}/admins"
+    headers = {"X-Cisco-Meraki-API-Key": api_key}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception("Error fetching admins: {}".format(response.text))
+
+# Main application class
+class MerakiUserManagerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Meraki User Manager")
+        
+        # Define API key label and entry box
+        self.api_key_label = tk.Label(root, text="API Key:")
+        self.api_key_label.pack()
+        
+        self.api_key_entry = tk.Entry(root, width=50, show="*")
+        self.api_key_entry.pack()
+
+        # Fetch organizations button
+        self.fetch_orgs_button = tk.Button(root, text="Fetch Organizations", command=self.load_organizations)
+        self.fetch_orgs_button.pack()
+        
+        # Listbox for organizations (multi-select)
+        self.org_label = tk.Label(root, text="Organizations (Ctrl+Click for multi-select):")
+        self.org_label.pack()
+        
+        self.org_listbox = tk.Listbox(root, selectmode=tk.MULTIPLE, width=50, height=5)
+        self.org_listbox.pack()
+        
+        # Dropdown menu for permissions
+        self.permission_label = tk.Label(root, text="Permission Level:")
+        self.permission_label.pack()
+        
+        self.permission_dropdown = ttk.Combobox(root, state="readonly")
+        self.permission_dropdown.pack()
+
+        # Username entry field
+        self.username_label = tk.Label(root, text="Username (Email):")
+        self.username_label.pack()
+        
+        self.username_entry = tk.Entry(root, width=50)
+        self.username_entry.pack()
+
+        # Create User button
+        self.create_user_button = tk.Button(root, text="Create User", command=self.create_user)
+        self.create_user_button.pack()
+
+        # Separator
+        ttk.Separator(root, orient='horizontal').pack(fill='x', pady=10)
+
+        # Remove User section
+        self.remove_user_label = tk.Label(root, text="Remove User")
+        self.remove_user_label.pack()
+
+        # Dropdown menu for admins
+        self.admin_label = tk.Label(root, text="Select Admin to Remove:")
+        self.admin_label.pack()
+        
+        self.admin_dropdown = ttk.Combobox(root, state="readonly")
+        self.admin_dropdown.pack()
+
+        # Remove User button
+        self.remove_user_button = tk.Button(root, text="Remove User", command=self.remove_user)
+        self.remove_user_button.pack()
+
+    def load_organizations(self):
+        try:
+            api_key = self.api_key_entry.get()
+            self.orgs = fetch_organizations(api_key)
+            self.org_listbox.delete(0, tk.END)
+            for org in self.orgs:
+                self.org_listbox.insert(tk.END, f"{org['id']} - {org['name']}")
+            perms = fetch_permissions(api_key)
+            self.permission_dropdown["values"] = [perm['id'] for perm in perms]
+            messagebox.showinfo("Success", "Organizations and permissions loaded successfully!")
+            
+            # Bind the organization selection to load admins
+            self.org_listbox.bind("<<ListboxSelect>>", self.load_admins)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def load_admins(self, event=None):
+        try:
+            api_key = self.api_key_entry.get()
+            selected_indices = self.org_listbox.curselection()
+            if not selected_indices:
+                return
+            
+            org_id = self.org_listbox.get(selected_indices[0]).split(" - ")[0]
+            admins = fetch_admins(api_key, org_id)
+            self.admin_dropdown["values"] = [f"{admin['id']} - {admin['email']}" for admin in admins]
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def create_user(self):
+        try:
+            api_key = self.api_key_entry.get()
+            selected_indices = self.org_listbox.curselection()
+            username = self.username_entry.get()
+            permission_level = self.permission_dropdown.get()
+            
+            if not api_key or not selected_indices or not username or not permission_level:
+                messagebox.showwarning("Missing Information", "All fields are required!")
+                return
+
+            success_count = 0
+            for index in selected_indices:
+                org_id = self.org_listbox.get(index).split(" - ")[0]
+                success, error = create_user(api_key, org_id, username, permission_level)
+                if success:
+                    success_count += 1
+                else:
+                    messagebox.showerror("Error", f"Failed to create user for org {org_id}: {error}")
+
+            messagebox.showinfo("Success", f"User created successfully in {success_count} organization(s)!")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def remove_user(self):
+        try:
+            api_key = self.api_key_entry.get()
+            selected_indices = self.org_listbox.curselection()
+            admin_id = self.admin_dropdown.get().split(" - ")[0]
+            
+            if not api_key or not selected_indices or not admin_id:
+                messagebox.showwarning("Missing Information", "API Key, Organization(s), and Admin must be selected!")
+                return
+
+            success_count = 0
+            for index in selected_indices:
+                org_id = self.org_listbox.get(index).split(" - ")[0]
+                success = remove_user(api_key, org_id, admin_id)
+                if success:
+                    success_count += 1
+                else:
+                    messagebox.showerror("Error", f"Failed to remove user from org {org_id}: {success[1]}")
+
+            messagebox.showinfo("Success", f"User removed successfully from {success_count} organization(s)!")
+            self.load_admins()  # Refresh the admin list
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+
+# Running the application
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MerakiUserManagerApp(root)
+    root.mainloop()
