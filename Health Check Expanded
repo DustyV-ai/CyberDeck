@@ -27,7 +27,7 @@ function Invoke-SafeCommand {
 }
 
 # Initialize an array to store health check results
-$healthChecks = @()
+$script:healthChecks = @()
 
 # 1. Check Event Logs for Errors
 Write-Host "Checking Event Logs for Errors..." -ForegroundColor Cyan
@@ -122,19 +122,23 @@ Invoke-SafeCommand -Command {
 # 6. Check Disk Space
 Write-Host "Checking Disk Space..." -ForegroundColor Cyan
 Invoke-SafeCommand -Command {
-    $disks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+    $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
     foreach ($disk in $disks) {
-        $freeSpacePercent = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
+        $freeSpaceGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+        $totalSpaceGB = [math]::Round($disk.Size / 1GB, 2)
+        $freeSpacePercent = [math]::Round(($freeSpaceGB / $totalSpaceGB) * 100, 2)
         if ($freeSpacePercent -lt 15) {
-            $healthChecks += [PSCustomObject]@{
+            $newCheck = [PSCustomObject]@{
                 Category = "Disk Space"
                 Issue = "Low Disk Space"
-                Details = "Drive $($disk.DeviceID) has only $freeSpacePercent% free space"
+                Details = "Drive $($disk.DeviceID) has only $freeSpacePercent% ($freeSpaceGB GB) free space out of $totalSpaceGB GB"
                 Recommendation = "Free up space by removing unnecessary files or consider upgrading disk capacity."
             }
+            $script:healthChecks += $newCheck
         }
     }
 } -ErrorMessage "Failed to check disk space"
+
 
 # 7. Check CPU and Memory Usage
 Write-Host "Checking CPU and Memory Usage..." -ForegroundColor Cyan
@@ -175,23 +179,6 @@ Invoke-SafeCommand -Command {
         }
     }
 } -ErrorMessage "Failed to check for system crashes"
-
-# 9. Check for Large Files
-Write-Host "Checking for Unusually Large Files..." -ForegroundColor Cyan
-Invoke-SafeCommand -Command {
-    $largeFiles = Get-ChildItem -Path C:\ -Recurse -ErrorAction SilentlyContinue | 
-                  Where-Object { $_.Length -gt 1GB } | 
-                  Sort-Object Length -Descending | 
-                  Select-Object -First 5
-    if ($largeFiles) {
-        $healthChecks += [PSCustomObject]@{
-            Category = "Disk Usage"
-            Issue = "Large Files Detected"
-            Details = "Found $($largeFiles.Count) files larger than 1GB"
-            Recommendation = "Review these large files and consider moving or deleting them to free up space."
-        }
-    }
-} -ErrorMessage "Failed to check for large files"
 
 # 10. Check for Outdated Drivers
 Write-Host "Checking for Outdated Drivers..." -ForegroundColor Cyan
