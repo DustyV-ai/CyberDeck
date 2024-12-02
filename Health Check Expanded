@@ -288,3 +288,4 @@ $reportPath = "$env:USERPROFILE\Desktop\SystemHealthReport.html"
 $htmlReport | Out-File -FilePath $reportPath -Encoding UTF8
 
 Write-Host "`nHTML report generated at: $reportPath" -ForegroundColor Green
+
