@@ -1,0 +1,290 @@
+# Function to write colored output
+function Write-ColorOutput($ForegroundColor) {
+    $fc = $host.UI.RawUI.ForegroundColor
+    $host.UI.RawUI.ForegroundColor = $ForegroundColor
+    if ($args) {
+        Write-Output $args
+    }
+    else {
+        $input | Write-Output
+    }
+    $host.UI.RawUI.ForegroundColor = $fc
+}
+
+# Function to safely execute commands and handle errors
+function Invoke-SafeCommand {
+    param (
+        [ScriptBlock]$Command,
+        [string]$ErrorMessage
+    )
+    try {
+        & $Command
+    }
+    catch {
+        Write-ColorOutput Red "Error: $ErrorMessage"
+        Write-ColorOutput Red "Details: $($_.Exception.Message)"
+    }
+}
+
+# Initialize an array to store health check results
+$healthChecks = @()
+
+# 1. Check Event Logs for Errors
+Write-Host "Checking Event Logs for Errors..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $recentErrors = Get-EventLog -LogName System -EntryType Error -Newest 50 -ErrorAction Stop | 
+                    Group-Object -Property Source -NoElement | 
+                    Sort-Object -Property Count -Descending
+    foreach ($errorSource in $recentErrors) {
+        if ($errorSource.Count -gt 5) {
+            $latestError = Get-EventLog -LogName System -EntryType Error -Source $errorSource.Name -Newest 1
+            $healthChecks += [PSCustomObject]@{
+                Issue = "Frequent System Errors"
+                Details = "$($errorSource.Count) recent errors from source: $($errorSource.Name)"
+                LatestErrorMessage = $latestError.Message
+                Recommendation = "Investigate the '$($errorSource.Name)' component. Check application logs, driver updates, or system stability."
+            }
+        }
+    }
+} -ErrorMessage "Failed to check Event Logs"
+
+# 2. Check Drive Health (S.M.A.R.T status)
+Write-Host "Checking Drive Health..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $physicalDisks = Get-PhysicalDisk | Where-Object MediaType -ne 'Unspecified'
+    foreach ($disk in $physicalDisks) {
+        if ($disk.HealthStatus -ne 'Healthy') {
+            $healthChecks += [PSCustomObject]@{
+                Issue = "Drive Health Issue"
+                Details = "Drive $($disk.DeviceId) health status: $($disk.HealthStatus)"
+                Recommendation = "Backup data immediately. Consider replacing the drive. Run 'chkdsk' for further diagnostics."
+            }
+        }
+    }
+} -ErrorMessage "Failed to check Drive Health"
+
+# 3. Check Services
+Write-Host "Checking Critical Services..." -ForegroundColor Cyan
+$criticalServices = @{
+    'wuauserv' = 'Windows Update'
+    'WinDefend' = 'Windows Defender'
+    'MpsSvc' = 'Windows Firewall'
+    'wscsvc' = 'Security Center'
+    'Dhcp' = 'DHCP Client'
+    'Dnscache' = 'DNS Client'
+}
+foreach ($service in $criticalServices.Keys) {
+    Invoke-SafeCommand -Command {
+        $serviceStatus = Get-Service -Name $service -ErrorAction Stop
+        if ($serviceStatus.Status -ne 'Running') {
+            $healthChecks += [PSCustomObject]@{
+                Issue = "Critical Service Not Running"
+                Details = "$($criticalServices[$service]) service ($service) is not running. Current status: $($serviceStatus.Status)"
+                Recommendation = "Try starting the service manually using 'Start-Service $service'. If it fails, check the system logs for related errors. Ensure the service is not disabled in the services management console."
+            }
+        }
+    } -ErrorMessage "Failed to check service $($criticalServices[$service])"
+}
+
+# 4. Check Network Connectivity
+Write-Host "Checking Network Connectivity..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $testConnection = Test-Connection -ComputerName www.google.com -Count 2 -Quiet
+    if (-not $testConnection) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Network Connectivity Problem"
+            Details = "Unable to reach www.google.com"
+            Recommendation = "Check your network adapter settings, Wi-Fi or Ethernet connection. Verify DNS settings. If on a corporate network, contact your IT support."
+        }
+    }
+} -ErrorMessage "Failed to check network connectivity"
+
+# 5. Check Windows Update Status
+Write-Host "Checking Windows Update Status..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $updateSession = New-Object -ComObject Microsoft.Update.Session
+    $updateSearcher = $updateSession.CreateUpdateSearcher()
+    $pendingUpdates = $updateSearcher.Search("IsInstalled=0 and Type='Software'").Updates.Count
+    if ($pendingUpdates -gt 0) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Pending Windows Updates"
+            Details = "$pendingUpdates updates are pending installation"
+            Recommendation = "Run Windows Update to install pending updates. Ensure automatic updates are enabled."
+        }
+    }
+} -ErrorMessage "Failed to check Windows Update status"
+
+# 6. Check Disk Space
+Write-Host "Checking Disk Space..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $disks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+    foreach ($disk in $disks) {
+        $freeSpacePercent = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
+        if ($freeSpacePercent -lt 15) {
+            $healthChecks += [PSCustomObject]@{
+                Issue = "Low Disk Space"
+                Details = "Drive $($disk.DeviceID) has only $freeSpacePercent% free space"
+                Recommendation = "Free up space by removing unnecessary files or consider upgrading disk capacity."
+            }
+        }
+    }
+} -ErrorMessage "Failed to check disk space"
+
+# 7. Check CPU and Memory Usage
+Write-Host "Checking CPU and Memory Usage..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $cpuUsage = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+    $memoryUsage = (Get-WmiObject Win32_OperatingSystem | Select-Object @{Name = "MemoryUsage"; Expression = {[math]::Round((($_.TotalVisibleMemorySize - $_.FreePhysicalMemory) / $_.TotalVisibleMemorySize) * 100, 2)}}).MemoryUsage
+
+    if ($cpuUsage -gt 90) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "High CPU Usage"
+            Details = "CPU usage is at $cpuUsage%"
+            Recommendation = "Check Task Manager for processes consuming high CPU. Consider upgrading CPU if this is frequent."
+        }
+    }
+
+    if ($memoryUsage -gt 90) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "High Memory Usage"
+            Details = "Memory usage is at $memoryUsage%"
+            Recommendation = "Check Task Manager for processes consuming high memory. Consider adding more RAM if this is frequent."
+        }
+    }
+} -ErrorMessage "Failed to check CPU and Memory usage"
+
+# Output Results
+Write-Host "`nSystem Health Check Results:" -ForegroundColor Yellow
+if ($healthChecks.Count -eq 0) {
+    Write-ColorOutput Green
+# 8. Check for Recent System Crashes
+Write-Host "Checking for Recent System Crashes..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $crashLogs = Get-WinEvent -FilterHashtable @{LogName='System'; ID=1001} -MaxEvents 5 -ErrorAction SilentlyContinue
+    if ($crashLogs) {
+        $latestCrash = $crashLogs[0]
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Recent System Crash Detected"
+            Details = "Latest crash occurred on $($latestCrash.TimeCreated)"
+            Recommendation = "Check for driver updates, run memory diagnostics, and monitor system temperature."
+        }
+    }
+} -ErrorMessage "Failed to check for system crashes"
+
+# 9. Check for Large Files
+Write-Host "Checking for Unusually Large Files..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $largeFiles = Get-ChildItem -Path C:\ -Recurse -ErrorAction SilentlyContinue | 
+                  Where-Object { $_.Length -gt 1GB } | 
+                  Sort-Object Length -Descending | 
+                  Select-Object -First 5
+    if ($largeFiles) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Large Files Detected"
+            Details = "Found $($largeFiles.Count) files larger than 1GB"
+            Recommendation = "Review these large files and consider moving or deleting them to free up space."
+        }
+    }
+} -ErrorMessage "Failed to check for large files"
+
+# 10. Check for Outdated Drivers
+Write-Host "Checking for Outdated Drivers..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $outdatedDrivers = Get-WmiObject Win32_PnPSignedDriver | 
+                       Where-Object { $_.DriverDate -lt (Get-Date).AddYears(-2) } |
+                       Select-Object -First 5
+    if ($outdatedDrivers) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Outdated Drivers Detected"
+            Details = "Found $($outdatedDrivers.Count) drivers older than 2 years"
+            Recommendation = "Update these drivers through Windows Update or the manufacturer's website."
+        }
+    }
+} -ErrorMessage "Failed to check for outdated drivers"
+
+# 11. Check for Unauthorized System Changes
+Write-Host "Checking for Unauthorized System Changes..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $recentInstalls = Get-WmiObject Win32_Product | 
+                      Where-Object { $_.InstallDate -gt (Get-Date).AddDays(-7) }
+    if ($recentInstalls) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Recent Software Installations"
+            Details = "Found $($recentInstalls.Count) software installations in the last 7 days"
+            Recommendation = "Review these recent installations to ensure they are authorized."
+        }
+    }
+} -ErrorMessage "Failed to check for recent software installations"
+
+# 12. Check for Pending Reboots
+Write-Host "Checking for Pending Reboots..." -ForegroundColor Cyan
+Invoke-SafeCommand -Command {
+    $pendingReboot = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($pendingReboot) {
+        $healthChecks += [PSCustomObject]@{
+            Issue = "Pending Reboot Detected"
+            Details = "System has pending changes that require a reboot"
+            Recommendation = "Save your work and restart the computer to apply pending changes."
+        }
+    }
+} -ErrorMessage "Failed to check for pending reboots"
+
+# Output Results
+Write-Host "`nSystem Health Check Results:" -ForegroundColor Yellow
+if ($healthChecks.Count -eq 0) {
+    Write-ColorOutput Green "No issues detected. System appears to be healthy."
+} else {
+    Write-ColorOutput Red "Found $($healthChecks.Count) potential issues:"
+    foreach ($issue in $healthChecks) {
+        Write-ColorOutput Red "`nIssue: $($issue.Issue)"
+        Write-Host "Details: $($issue.Details)"
+        if ($issue.LatestErrorMessage) {
+            Write-Host "Latest Error Message: $($issue.LatestErrorMessage)"
+        }
+        Write-ColorOutput Yellow "Recommendation: $($issue.Recommendation)"
+    }
+}
+
+# Generate HTML Report
+$htmlReport = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Health Check Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        h1 { color: #2c3e50; }
+        .issue { background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 5px; padding: 10px; margin-bottom: 10px; }
+        .issue h3 { color: #721c24; margin-top: 0; }
+        .recommendation { background-color: #fff3cd; border: 1px solid #ffeeba; border-radius: 5px; padding: 10px; }
+    </style>
+</head>
+<body>
+    <h1>System Health Check Report</h1>
+    <p>Report generated on $(Get-Date)</p>
+    $(if ($healthChecks.Count -eq 0) {
+        "<p style='color: green;'>No issues detected. System appears to be healthy.</p>"
+    } else {
+        $healthChecks | ForEach-Object {
+            @"
+            <div class="issue">
+                <h3>$($_.Issue)</h3>
+                <p>$($_.Details)</p>
+                $(if ($_.LatestErrorMessage) { "<p><strong>Latest Error Message:</strong> $($_.LatestErrorMessage)</p>" })
+                <div class="recommendation">
+                    <strong>Recommendation:</strong> $($_.Recommendation)
+                </div>
+            </div>
+"@
+        }
+    })
+</body>
+</html>
+"@
+
+$reportPath = "$env:USERPROFILE\Desktop\SystemHealthReport.html"
+$htmlReport | Out-File -FilePath $reportPath -Encoding UTF8
+
+Write-Host "`nHTML report generated at: $reportPath" -ForegroundColor Green
