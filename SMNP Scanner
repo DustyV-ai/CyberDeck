@@ -1,0 +1,114 @@
+import ipaddress
+from pysnmp.hlapi import *
+from pysnmp.smi import builder, view, compiler
+
+def create_mib_builder():
+    mib_builder = builder.MibBuilder()
+    compiler.addMibCompiler(mib_builder, sources=[])
+    mib_view_controller = view.MibViewController(mib_builder)
+    return mib_view_controller
+
+def scan_subnet(subnet, community_string, snmp_version='v2c'):
+    network = ipaddress.ip_network(subnet)
+    mib_view_controller = create_mib_builder()
+    
+    for ip in network.hosts():
+        ip_str = str(ip)
+        print(f"\nScanning {ip_str}...")
+        
+        try:
+            if snmp_version == 'v1':
+                auth_data = CommunityData(community_string, mpModel=0)
+            elif snmp_version == 'v2c':
+                auth_data = CommunityData(community_string, mpModel=1)
+            else:
+                print(f"Unsupported SNMP version: {snmp_version}")
+                continue
+
+            errorIndication, errorStatus, errorIndex, varBinds = next(
+                getCmd(SnmpEngine(),
+                       auth_data,
+                       UdpTransportTarget((ip_str, 161)),
+                       ContextData(),
+                       ObjectType(ObjectIdentity('SNMPv2-MIB', 'sysDescr', 0)))
+            )
+
+            if errorIndication:
+                print(f"Error: {errorIndication}")
+            elif errorStatus:
+                print(f"Error: {errorStatus.prettyPrint()} at {errorIndex and varBinds[int(errorIndex) - 1][0] or '?'}")
+            else:
+                for varBind in varBinds:
+                    print(f" = ".join([x.prettyPrint() for x in varBind]))
+                
+                get_more_info(ip_str, auth_data, mib_view_controller)
+        
+        except Exception as e:
+            print(f"An error occurred while scanning {ip_str}: {str(e)}")
+
+def get_more_info(ip, auth_data, mib_view_controller):
+    oids = [
+        ObjectType(ObjectIdentity('SNMPv2-MIB', 'sysName', 0)),
+        ObjectType(ObjectIdentity('SNMPv2-MIB', 'sysLocation', 0)),
+        ObjectType(ObjectIdentity('SNMPv2-MIB', 'sysContact', 0)),
+        ObjectType(ObjectIdentity('IF-MIB', 'ifNumber', 0)),
+        ObjectType(ObjectIdentity('HOST-RESOURCES-MIB', 'hrSystemUptime', 0)),
+        ObjectType(ObjectIdentity('IP-MIB', 'ipAddrTable')),
+        ObjectType(ObjectIdentity('IF-MIB', 'ifTable')),
+    ]
+    
+    for oid in oids:
+        try:
+            if oid.prettyPrint().endswith('Table'):
+                walk_table(ip, auth_data, oid, mib_view_controller)
+            else:
+                errorIndication, errorStatus, errorIndex, varBinds = next(
+                    getCmd(SnmpEngine(),
+                           auth_data,
+                           UdpTransportTarget((ip, 161)),
+                           ContextData(),
+                           oid)
+                )
+
+                if errorIndication:
+                    print(f"Error: {errorIndication}")
+                elif errorStatus:
+                    print(f"Error: {errorStatus.prettyPrint()} at {errorIndex and varBinds[int(errorIndex) - 1][0] or '?'}")
+                else:
+                    for varBind in varBinds:
+                        print(f" = ".join([x.prettyPrint() for x in varBind]))
+        except Exception as e:
+            print(f"Error querying {oid.prettyPrint()}: {str(e)}")
+
+def walk_table(ip, auth_data, oid, mib_view_controller):
+    print(f"\nWalking {oid.prettyPrint()}:")
+    for (errorIndication,
+         errorStatus,
+         errorIndex,
+         varBinds) in nextCmd(SnmpEngine(),
+                              auth_data,
+                              UdpTransportTarget((ip, 161)),
+                              ContextData(),
+                              oid,
+                              lexicographicMode=False):
+
+        if errorIndication:
+            print(f"Error: {errorIndication}")
+            break
+        elif errorStatus:
+            print(f"Error: {errorStatus.prettyPrint()} at {errorIndex and varBinds[int(errorIndex) - 1][0] or '?'}")
+            break
+        else:
+            for varBind in varBinds:
+                print(f" = ".join([x.prettyPrint() for x in varBind]))
+
+if __name__ == "__main__":
+    subnet = input("Enter the subnet to scan (e.g., 192.168.1.0/24): ")
+    community_string = input("Enter the SNMP community string: ")
+    snmp_version = input("Enter SNMP version (v1 or v2c): ").lower()
+    
+    if snmp_version not in ['v1', 'v2c']:
+        print("Invalid SNMP version. Using v2c as default.")
+        snmp_version = 'v2c'
+    
+    scan_subnet(subnet, community_string, snmp_version)
