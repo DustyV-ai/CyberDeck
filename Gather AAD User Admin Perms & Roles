@@ -1,0 +1,105 @@
+# Import required modules
+Import-Module Microsoft.Graph.Identity.DirectoryManagement
+Import-Module Microsoft.Graph.Groups
+Import-Module Microsoft.Graph.Users
+
+# Function to ensure module is installed and imported
+function Ensure-Module {
+    param (
+        [string]$ModuleName,
+        [string]$MinimumVersion = ""
+    )
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Host "Installing module $ModuleName..."
+        Install-Module -Name $ModuleName -Force -AllowClobber -Scope CurrentUser
+    }
+
+    Import-Module $ModuleName -Force
+}
+
+# Ensure required modules are available
+Ensure-Module -ModuleName Microsoft.Graph.Identity.DirectoryManagement
+Ensure-Module -ModuleName Microsoft.Graph.Groups
+Ensure-Module -ModuleName Microsoft.Graph.Users
+
+# Connect to Microsoft Graph
+Connect-MgGraph -Scopes "Directory.Read.All", "Group.Read.All", "User.Read.All"
+
+# Function to get all privileged roles
+function Get-PrivilegedRoles {
+    $roles = Get-MgDirectoryRole -All
+    $privilegedRoles = $roles | Where-Object { 
+        $_.DisplayName -match "Admin|Owner|Manager" -or
+        $_.DisplayName -in @(
+            "Global Administrator",
+            "Security Administrator",
+            "User Administrator",
+            "Exchange Administrator",
+            "SharePoint Administrator",
+            "Teams Administrator",
+            "Power Platform Administrator",
+            "Privileged Role Administrator",
+            "Conditional Access Administrator",
+            "Application Administrator",
+            "Cloud Application Administrator",
+            "Azure AD Joined Device Local Administrator"
+        )
+    }
+    return $privilegedRoles
+}
+
+# Function to get users in a role
+function Get-UsersInRole {
+    param (
+        [string]$RoleId
+    )
+    
+    $members = Get-MgDirectoryRoleMember -DirectoryRoleId $RoleId
+    return $members
+}
+
+# Function to get user's group memberships
+function Get-UserGroups {
+    param (
+        [string]$UserId
+    )
+    
+    $groups = Get-MgUserMemberOf -UserId $UserId
+    return $groups | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.group' }
+}
+
+# Main execution
+$privilegedRoles = Get-PrivilegedRoles
+
+$results = @()
+
+foreach ($role in $privilegedRoles) {
+    $usersInRole = Get-UsersInRole -RoleId $role.Id
+    
+    foreach ($user in $usersInRole) {
+        $userDetails = Get-MgUser -UserId $user.Id
+        $userGroups = Get-UserGroups -UserId $user.Id
+        
+        $groupNames = $userGroups | ForEach-Object { $_.DisplayName }
+        
+        $results += [PSCustomObject]@{
+            UserPrincipalName = $userDetails.UserPrincipalName
+            DisplayName = $userDetails.DisplayName
+            PrivilegedRole = $role.DisplayName
+            RoleDescription = $role.Description
+            Groups = ($groupNames -join ", ")
+        }
+    }
+}
+
+# Display results
+$results | Format-Table -AutoSize
+
+# Export results to CSV
+$results | Export-Csv -Path "PrivilegedUsers_and_Groups.csv" -NoTypeInformation
+
+Write-Host "Results exported to PrivilegedUsers_and_Groups.csv"
+
+# Disconnect from Microsoft Graph
+Disconnect-MgGraph
