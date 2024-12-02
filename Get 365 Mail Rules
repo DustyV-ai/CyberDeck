@@ -1,0 +1,161 @@
+# Import the Exchange Online Management module
+if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+    Write-Host "ExchangeOnlineManagement module is not installed. Attempting to install..."
+    try {
+        Install-Module -Name ExchangeOnlineManagement -Force -AllowClobber -Scope CurrentUser
+    }
+    catch {
+        Write-Host "Failed to install ExchangeOnlineManagement module. Error: $_" -ForegroundColor Red
+        exit
+    }
+}
+
+Import-Module ExchangeOnlineManagement
+
+# Connect to Exchange Online
+try {
+    Connect-ExchangeOnline -ErrorAction Stop
+}
+catch {
+    Write-Host "Failed to connect to Exchange Online. Error: $_" -ForegroundColor Red
+    exit
+}
+
+# Function to format conditions and actions
+function Format-RuleDetails {
+    param (
+        [PSObject]$Rule
+    )
+
+    $details = @()
+    
+    # Format conditions
+    $details += "Conditions:"
+    if ($Rule.Conditions) {
+        foreach ($condition in $Rule.Conditions.PSObject.Properties) {
+            $details += "  - $($condition.Name): $($condition.Value -join ', ')"
+        }
+    } else {
+        $details += "  - No conditions specified (applies to all messages)"
+    }
+
+    # Format exceptions
+    $details += "Exceptions:"
+    if ($Rule.Exceptions) {
+        foreach ($exception in $Rule.Exceptions.PSObject.Properties) {
+            $details += "  - $($exception.Name): $($exception.Value -join ', ')"
+        }
+    } else {
+        $details += "  - No exceptions specified"
+    }
+
+    # Format actions
+    $details += "Actions:"
+    if ($Rule.Actions) {
+        foreach ($action in $Rule.Actions.PSObject.Properties) {
+            $details += "  - $($action.Name): $($action.Value -join ', ')"
+        }
+    } else {
+        $details += "  - No actions specified"
+    }
+
+    return $details -join "`n"
+}
+
+# Function to get and display spam filter lists
+function Get-SpamFilterLists {
+    try {
+        $hostedContentFilterPolicies = Get-HostedContentFilterPolicy
+
+        foreach ($policy in $hostedContentFilterPolicies) {
+            Write-Host "======================================" -ForegroundColor Cyan
+            Write-Host "Spam Filter Policy: $($policy.Name)" -ForegroundColor Green
+            
+            Write-Host "`nAllow List (IP Addresses):"
+            if ($policy.IPAllowList) {
+                $policy.IPAllowList | ForEach-Object { Write-Host "  - $_" }
+            } else {
+                Write-Host "  No IP addresses in the allow list."
+            }
+
+            Write-Host "`nAllow List (Domains):"
+            if ($policy.AllowedSenderDomains) {
+                $policy.AllowedSenderDomains | ForEach-Object { Write-Host "  - $_" }
+            } else {
+                Write-Host "  No domains in the allow list."
+            }
+
+            Write-Host "`nAllow List (Email Addresses):"
+            if ($policy.AllowedSenders) {
+                $policy.AllowedSenders | ForEach-Object { Write-Host "  - $_" }
+            } else {
+                Write-Host "  No email addresses in the allow list."
+            }
+
+            Write-Host "`nBlock List (IP Addresses):"
+            if ($policy.IPBlockList) {
+                $policy.IPBlockList | ForEach-Object { Write-Host "  - $_" }
+            } else {
+                Write-Host "  No IP addresses in the block list."
+            }
+
+            Write-Host "`nBlock List (Domains):"
+            if ($policy.BlockedSenderDomains) {
+                $policy.BlockedSenderDomains | ForEach-Object { Write-Host "  - $_" }
+            } else {
+                Write-Host "  No domains in the block list."
+            }
+
+            Write-Host "`nBlock List (Email Addresses):"
+            if ($policy.BlockedSenders) {
+                $policy.BlockedSenders | ForEach-Object { Write-Host "  - $_" }
+            } else {
+                Write-Host "  No email addresses in the block list."
+            }
+
+            Write-Host ""
+        }
+    }
+    catch {
+        Write-Host "Error retrieving spam filter lists: $_" -ForegroundColor Red
+    }
+}
+
+# Get all mail flow rules
+try {
+    $rules = Get-TransportRule | Sort-Object Priority
+    
+    if ($rules.Count -eq 0) {
+        Write-Host "No mail flow rules found." -ForegroundColor Yellow
+    } else {
+        foreach ($rule in $rules) {
+            Write-Host "======================================" -ForegroundColor Cyan
+            Write-Host "Rule Name: $($rule.Name)" -ForegroundColor Green
+            Write-Host "Priority: $($rule.Priority)"
+            Write-Host "State: $($rule.State)"
+            Write-Host "Mode: $($rule.Mode)"
+            Write-Host "Description: $($rule.Description)"
+            Write-Host ""
+            Write-Host (Format-RuleDetails -Rule $rule)
+            Write-Host ""
+        }
+        Write-Host "Total Rules: $($rules.Count)" -ForegroundColor Cyan
+    }
+}
+catch {
+    Write-Host "Error retrieving mail flow rules: $_" -ForegroundColor Red
+}
+
+# Get spam filter lists
+Write-Host "`n======================================" -ForegroundColor Cyan
+Write-Host "Spam Filter Lists" -ForegroundColor Green
+Get-SpamFilterLists
+
+# Disconnect from Exchange Online
+try {
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
+    Write-Host "`nSuccessfully disconnected from Exchange Online." -ForegroundColor Green
+}
+catch {
+    Write-Host "Error disconnecting from Exchange Online: $_" -ForegroundColor Red
+}
