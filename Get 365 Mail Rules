@@ -1,23 +1,38 @@
+# Function for consistent color output
+function Write-ColorOutput {
+    param (
+        [string]$Message,
+        [string]$ForegroundColor = 'White'
+    )
+    Write-Host $Message -ForegroundColor $ForegroundColor
+}
+
 # Import the Exchange Online Management module
 if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
-    Write-Host "ExchangeOnlineManagement module is not installed. Attempting to install..."
+    Write-ColorOutput "ExchangeOnlineManagement module is not installed. Attempting to install..." -ForegroundColor Yellow
     try {
         Install-Module -Name ExchangeOnlineManagement -Force -AllowClobber -Scope CurrentUser
     }
     catch {
-        Write-Host "Failed to install ExchangeOnlineManagement module. Error: $_" -ForegroundColor Red
+        Write-ColorOutput "Failed to install ExchangeOnlineManagement module. Error: $_" -ForegroundColor Red
         exit
     }
 }
 
-Import-Module ExchangeOnlineManagement
+try {
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+}
+catch {
+    Write-ColorOutput "Failed to import ExchangeOnlineManagement module. Error: $_" -ForegroundColor Red
+    exit
+}
 
 # Connect to Exchange Online
 try {
     Connect-ExchangeOnline -ErrorAction Stop
 }
 catch {
-    Write-Host "Failed to connect to Exchange Online. Error: $_" -ForegroundColor Red
+    Write-ColorOutput "Failed to connect to Exchange Online. Error: $_" -ForegroundColor Red
     exit
 }
 
@@ -27,36 +42,37 @@ function Format-RuleDetails {
         [PSObject]$Rule
     )
 
+    function Format-Property {
+        param (
+            [PSObject]$Property,
+            [int]$Indent = 2
+        )
+
+        $output = @()
+        foreach ($prop in $Property.PSObject.Properties) {
+            $value = if ($prop.Value -is [array]) {
+                $prop.Value -join ', '
+            } elseif ($prop.Value -is [PSObject]) {
+                "`n" + (Format-Property -Property $prop.Value -Indent ($Indent + 2))
+            } else {
+                $prop.Value
+            }
+            $output += "{0}{1}: {2}" -f (' ' * $Indent), $prop.Name, $value
+        }
+        return $output -join "`n"
+    }
+
+    $sections = @('Conditions', 'Exceptions', 'Actions')
     $details = @()
-    
-    # Format conditions
-    $details += "Conditions:"
-    if ($Rule.Conditions) {
-        foreach ($condition in $Rule.Conditions.PSObject.Properties) {
-            $details += "  - $($condition.Name): $($condition.Value -join ', ')"
-        }
-    } else {
-        $details += "  - No conditions specified (applies to all messages)"
-    }
 
-    # Format exceptions
-    $details += "Exceptions:"
-    if ($Rule.Exceptions) {
-        foreach ($exception in $Rule.Exceptions.PSObject.Properties) {
-            $details += "  - $($exception.Name): $($exception.Value -join ', ')"
+    foreach ($section in $sections) {
+        $details += $section + ":"
+        if ($Rule.$section) {
+            $details += Format-Property -Property $Rule.$section
+        } else {
+            $details += "  No $section specified"
         }
-    } else {
-        $details += "  - No exceptions specified"
-    }
-
-    # Format actions
-    $details += "Actions:"
-    if ($Rule.Actions) {
-        foreach ($action in $Rule.Actions.PSObject.Properties) {
-            $details += "  - $($action.Name): $($action.Value -join ', ')"
-        }
-    } else {
-        $details += "  - No actions specified"
+        $details += ""
     }
 
     return $details -join "`n"
@@ -68,94 +84,147 @@ function Get-SpamFilterLists {
         $hostedContentFilterPolicies = Get-HostedContentFilterPolicy
 
         foreach ($policy in $hostedContentFilterPolicies) {
-            Write-Host "======================================" -ForegroundColor Cyan
-            Write-Host "Spam Filter Policy: $($policy.Name)" -ForegroundColor Green
+            Write-ColorOutput "======================================" -ForegroundColor Cyan
+            Write-ColorOutput "Spam Filter Policy: $($policy.Name)" -ForegroundColor Green
             
-            Write-Host "`nAllow List (IP Addresses):"
+            Write-ColorOutput "`nAllow List (IP Addresses):"
             if ($policy.IPAllowList) {
-                $policy.IPAllowList | ForEach-Object { Write-Host "  - $_" }
+                $policy.IPAllowList | ForEach-Object { Write-ColorOutput "  - $_" }
             } else {
-                Write-Host "  No IP addresses in the allow list."
+                Write-ColorOutput "  No IP addresses in the allow list."
             }
 
-            Write-Host "`nAllow List (Domains):"
+            Write-ColorOutput "`nAllow List (Domains):"
             if ($policy.AllowedSenderDomains) {
-                $policy.AllowedSenderDomains | ForEach-Object { Write-Host "  - $_" }
+                $policy.AllowedSenderDomains | ForEach-Object { Write-ColorOutput "  - $_" }
             } else {
-                Write-Host "  No domains in the allow list."
+                Write-ColorOutput "  No domains in the allow list."
             }
 
-            Write-Host "`nAllow List (Email Addresses):"
+            Write-ColorOutput "`nAllow List (Email Addresses):"
             if ($policy.AllowedSenders) {
-                $policy.AllowedSenders | ForEach-Object { Write-Host "  - $_" }
+                $policy.AllowedSenders | ForEach-Object { Write-ColorOutput "  - $_" }
             } else {
-                Write-Host "  No email addresses in the allow list."
+                Write-ColorOutput "  No email addresses in the allow list."
             }
 
-            Write-Host "`nBlock List (IP Addresses):"
+            Write-ColorOutput "`nBlock List (IP Addresses):"
             if ($policy.IPBlockList) {
-                $policy.IPBlockList | ForEach-Object { Write-Host "  - $_" }
+                $policy.IPBlockList | ForEach-Object { Write-ColorOutput "  - $_" }
             } else {
-                Write-Host "  No IP addresses in the block list."
+                Write-ColorOutput "  No IP addresses in the block list."
             }
 
-            Write-Host "`nBlock List (Domains):"
+            Write-ColorOutput "`nBlock List (Domains):"
             if ($policy.BlockedSenderDomains) {
-                $policy.BlockedSenderDomains | ForEach-Object { Write-Host "  - $_" }
+                $policy.BlockedSenderDomains | ForEach-Object { Write-ColorOutput "  - $_" }
             } else {
-                Write-Host "  No domains in the block list."
+                Write-ColorOutput "  No domains in the block list."
             }
 
-            Write-Host "`nBlock List (Email Addresses):"
+            Write-ColorOutput "`nBlock List (Email Addresses):"
             if ($policy.BlockedSenders) {
-                $policy.BlockedSenders | ForEach-Object { Write-Host "  - $_" }
+                $policy.BlockedSenders | ForEach-Object { Write-ColorOutput "  - $_" }
             } else {
-                Write-Host "  No email addresses in the block list."
+                Write-ColorOutput "  No email addresses in the block list."
             }
 
-            Write-Host ""
+            Write-ColorOutput ""
         }
     }
     catch {
-        Write-Host "Error retrieving spam filter lists: $_" -ForegroundColor Red
+        Write-ColorOutput "Error retrieving spam filter lists: $_" -ForegroundColor Red
     }
 }
 
+function Get-SpamFilterSummary {
+    $policies = Get-HostedContentFilterPolicy
+    $summary = @{
+        TotalPolicies = $policies.Count
+        TotalIPAllowList = 0
+        TotalIPBlockList = 0
+        TotalAllowedSenderDomains = 0
+        TotalBlockedSenderDomains = 0
+        TotalAllowedSenders = 0
+        TotalBlockedSenders = 0
+    }
+
+    foreach ($policy in $policies) {
+        $summary.TotalIPAllowList += if ($policy.IPAllowList) { $policy.IPAllowList.Count } else { 0 }
+        $summary.TotalIPBlockList += if ($policy.IPBlockList) { $policy.IPBlockList.Count } else { 0 }
+        $summary.TotalAllowedSenderDomains += if ($policy.AllowedSenderDomains) { $policy.AllowedSenderDomains.Count } else { 0 }
+        $summary.TotalBlockedSenderDomains += if ($policy.BlockedSenderDomains) { $policy.BlockedSenderDomains.Count } else { 0 }
+        $summary.TotalAllowedSenders += if ($policy.AllowedSenders) { $policy.AllowedSenders.Count } else { 0 }
+        $summary.TotalBlockedSenders += if ($policy.BlockedSenders) { $policy.BlockedSenders.Count } else { 0 }
+    }
+
+    return $summary
+}
+
 # Get all mail flow rules
+$output = @()
 try {
     $rules = Get-TransportRule | Sort-Object Priority
     
     if ($rules.Count -eq 0) {
-        Write-Host "No mail flow rules found." -ForegroundColor Yellow
+        Write-ColorOutput "No mail flow rules found." -ForegroundColor Yellow
     } else {
+        $totalRules = $rules.Count
+        $currentRule = 0
         foreach ($rule in $rules) {
-            Write-Host "======================================" -ForegroundColor Cyan
-            Write-Host "Rule Name: $($rule.Name)" -ForegroundColor Green
-            Write-Host "Priority: $($rule.Priority)"
-            Write-Host "State: $($rule.State)"
-            Write-Host "Mode: $($rule.Mode)"
-            Write-Host "Description: $($rule.Description)"
-            Write-Host ""
-            Write-Host (Format-RuleDetails -Rule $rule)
-            Write-Host ""
+            $currentRule++
+            Write-Progress -Activity "Processing Mail Flow Rules" -Status "Rule $currentRule of $totalRules" -PercentComplete (($currentRule / $totalRules) * 100)
+            
+            $output += "======================================"
+            $output += "Rule Name: $($rule.Name)"
+            $output += "Priority: $($rule.Priority)"
+            $output += "State: $($rule.State)"
+            $output += "Mode: $($rule.Mode)"
+            $output += "Description: $($rule.Description)"
+            $output += ""
+            $output += Format-RuleDetails -Rule $rule
+            $output += ""
         }
-        Write-Host "Total Rules: $($rules.Count)" -ForegroundColor Cyan
+        Write-Progress -Activity "Processing Mail Flow Rules" -Completed
+        Write-ColorOutput "Total Rules: $($rules.Count)" -ForegroundColor Cyan
     }
 }
 catch {
-    Write-Host "Error retrieving mail flow rules: $_" -ForegroundColor Red
+    Write-ColorOutput "Error retrieving mail flow rules: $_" -ForegroundColor Red
 }
 
+# Display mail flow rules
+$output | ForEach-Object { Write-ColorOutput $_ }
+
 # Get spam filter lists
-Write-Host "`n======================================" -ForegroundColor Cyan
-Write-Host "Spam Filter Lists" -ForegroundColor Green
+Write-ColorOutput "`n======================================" -ForegroundColor Cyan
+Write-ColorOutput "Spam Filter Lists" -ForegroundColor Green
 Get-SpamFilterLists
+
+# Display spam filter summary
+$spamFilterSummary = Get-SpamFilterSummary
+Write-ColorOutput "`nSpam Filter Summary:" -ForegroundColor Cyan
+Write-ColorOutput "Total Policies: $($spamFilterSummary.TotalPolicies)"
+Write-ColorOutput "Total IP Addresses (Allow List): $($spamFilterSummary.TotalIPAllowList)"
+Write-ColorOutput "Total IP Addresses (Block List): $($spamFilterSummary.TotalIPBlockList)"
+Write-ColorOutput "Total Domains (Allow List): $($spamFilterSummary.TotalAllowedSenderDomains)"
+Write-ColorOutput "Total Domains (Block List): $($spamFilterSummary.TotalBlockedSenderDomains)"
+Write-ColorOutput "Total Email Addresses (Allow List): $($spamFilterSummary.TotalAllowedSenders)"
+Write-ColorOutput "Total Email Addresses (Block List): $($spamFilterSummary.TotalBlockedSenders)"
+
+# Option to export results to a file
+$exportToFile = Read-Host "Do you want to export the results to a file? (Y/N)"
+if ($exportToFile -eq 'Y') {
+    $filePath = Read-Host "Enter the file path for the export (e.g., C:\ExportedRules.txt)"
+    $output | Out-File -FilePath $filePath -Encoding UTF8
+    Write-ColorOutput "Results exported to $filePath" -ForegroundColor Green
+}
 
 # Disconnect from Exchange Online
 try {
     Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
-    Write-Host "`nSuccessfully disconnected from Exchange Online." -ForegroundColor Green
+    Write-ColorOutput "`nSuccessfully disconnected from Exchange Online." -ForegroundColor Green
 }
 catch {
-    Write-Host "Error disconnecting from Exchange Online: $_" -ForegroundColor Red
+    Write-ColorOutput "Error disconnecting from Exchange Online: $_" -ForegroundColor Red
 }
