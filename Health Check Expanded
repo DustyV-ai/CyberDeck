@@ -39,6 +39,7 @@ Invoke-SafeCommand -Command {
         if ($errorSource.Count -gt 5) {
             $latestError = Get-EventLog -LogName System -EntryType Error -Source $errorSource.Name -Newest 1
             $healthChecks += [PSCustomObject]@{
+                Category = "Event Logs"
                 Issue = "Frequent System Errors"
                 Details = "$($errorSource.Count) recent errors from source: $($errorSource.Name)"
                 LatestErrorMessage = $latestError.Message
@@ -55,6 +56,7 @@ Invoke-SafeCommand -Command {
     foreach ($disk in $physicalDisks) {
         if ($disk.HealthStatus -ne 'Healthy') {
             $healthChecks += [PSCustomObject]@{
+                Category = "Drive Health"
                 Issue = "Drive Health Issue"
                 Details = "Drive $($disk.DeviceId) health status: $($disk.HealthStatus)"
                 Recommendation = "Backup data immediately. Consider replacing the drive. Run 'chkdsk' for further diagnostics."
@@ -78,9 +80,10 @@ foreach ($service in $criticalServices.Keys) {
         $serviceStatus = Get-Service -Name $service -ErrorAction Stop
         if ($serviceStatus.Status -ne 'Running') {
             $healthChecks += [PSCustomObject]@{
+                Category = "Services"
                 Issue = "Critical Service Not Running"
                 Details = "$($criticalServices[$service]) service ($service) is not running. Current status: $($serviceStatus.Status)"
-                Recommendation = "Try starting the service manually using 'Start-Service $service'. If it fails, check the system logs for related errors. Ensure the service is not disabled in the services management console."
+                Recommendation = "Try starting the service manually using 'Start-Service $service'. If it fails, check the system logs for related errors."
             }
         }
     } -ErrorMessage "Failed to check service $($criticalServices[$service])"
@@ -92,9 +95,10 @@ Invoke-SafeCommand -Command {
     $testConnection = Test-Connection -ComputerName www.google.com -Count 2 -Quiet
     if (-not $testConnection) {
         $healthChecks += [PSCustomObject]@{
+            Category = "Network"
             Issue = "Network Connectivity Problem"
             Details = "Unable to reach www.google.com"
-            Recommendation = "Check your network adapter settings, Wi-Fi or Ethernet connection. Verify DNS settings. If on a corporate network, contact your IT support."
+            Recommendation = "Check your network adapter settings, Wi-Fi or Ethernet connection. Verify DNS settings."
         }
     }
 } -ErrorMessage "Failed to check network connectivity"
@@ -107,6 +111,7 @@ Invoke-SafeCommand -Command {
     $pendingUpdates = $updateSearcher.Search("IsInstalled=0 and Type='Software'").Updates.Count
     if ($pendingUpdates -gt 0) {
         $healthChecks += [PSCustomObject]@{
+            Category = "Windows Update"
             Issue = "Pending Windows Updates"
             Details = "$pendingUpdates updates are pending installation"
             Recommendation = "Run Windows Update to install pending updates. Ensure automatic updates are enabled."
@@ -122,6 +127,7 @@ Invoke-SafeCommand -Command {
         $freeSpacePercent = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
         if ($freeSpacePercent -lt 15) {
             $healthChecks += [PSCustomObject]@{
+                Category = "Disk Space"
                 Issue = "Low Disk Space"
                 Details = "Drive $($disk.DeviceID) has only $freeSpacePercent% free space"
                 Recommendation = "Free up space by removing unnecessary files or consider upgrading disk capacity."
@@ -138,6 +144,7 @@ Invoke-SafeCommand -Command {
 
     if ($cpuUsage -gt 90) {
         $healthChecks += [PSCustomObject]@{
+            Category = "System Resources"
             Issue = "High CPU Usage"
             Details = "CPU usage is at $cpuUsage%"
             Recommendation = "Check Task Manager for processes consuming high CPU. Consider upgrading CPU if this is frequent."
@@ -146,6 +153,7 @@ Invoke-SafeCommand -Command {
 
     if ($memoryUsage -gt 90) {
         $healthChecks += [PSCustomObject]@{
+            Category = "System Resources"
             Issue = "High Memory Usage"
             Details = "Memory usage is at $memoryUsage%"
             Recommendation = "Check Task Manager for processes consuming high memory. Consider adding more RAM if this is frequent."
@@ -153,10 +161,6 @@ Invoke-SafeCommand -Command {
     }
 } -ErrorMessage "Failed to check CPU and Memory usage"
 
-# Output Results
-Write-Host "`nSystem Health Check Results:" -ForegroundColor Yellow
-if ($healthChecks.Count -eq 0) {
-    Write-ColorOutput Green
 # 8. Check for Recent System Crashes
 Write-Host "Checking for Recent System Crashes..." -ForegroundColor Cyan
 Invoke-SafeCommand -Command {
@@ -164,6 +168,7 @@ Invoke-SafeCommand -Command {
     if ($crashLogs) {
         $latestCrash = $crashLogs[0]
         $healthChecks += [PSCustomObject]@{
+            Category = "System Stability"
             Issue = "Recent System Crash Detected"
             Details = "Latest crash occurred on $($latestCrash.TimeCreated)"
             Recommendation = "Check for driver updates, run memory diagnostics, and monitor system temperature."
@@ -180,6 +185,7 @@ Invoke-SafeCommand -Command {
                   Select-Object -First 5
     if ($largeFiles) {
         $healthChecks += [PSCustomObject]@{
+            Category = "Disk Usage"
             Issue = "Large Files Detected"
             Details = "Found $($largeFiles.Count) files larger than 1GB"
             Recommendation = "Review these large files and consider moving or deleting them to free up space."
@@ -195,6 +201,7 @@ Invoke-SafeCommand -Command {
                        Select-Object -First 5
     if ($outdatedDrivers) {
         $healthChecks += [PSCustomObject]@{
+            Category = "Drivers"
             Issue = "Outdated Drivers Detected"
             Details = "Found $($outdatedDrivers.Count) drivers older than 2 years"
             Recommendation = "Update these drivers through Windows Update or the manufacturer's website."
@@ -209,6 +216,7 @@ Invoke-SafeCommand -Command {
                       Where-Object { $_.InstallDate -gt (Get-Date).AddDays(-7) }
     if ($recentInstalls) {
         $healthChecks += [PSCustomObject]@{
+            Category = "System Changes"
             Issue = "Recent Software Installations"
             Details = "Found $($recentInstalls.Count) software installations in the last 7 days"
             Recommendation = "Review these recent installations to ensure they are authorized."
@@ -222,6 +230,7 @@ Invoke-SafeCommand -Command {
     $pendingReboot = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
     if ($pendingReboot) {
         $healthChecks += [PSCustomObject]@{
+            Category = "System State"
             Issue = "Pending Reboot Detected"
             Details = "System has pending changes that require a reboot"
             Recommendation = "Save your work and restart the computer to apply pending changes."
@@ -235,57 +244,16 @@ if ($healthChecks.Count -eq 0) {
     Write-ColorOutput Green "No issues detected. System appears to be healthy."
 } else {
     Write-ColorOutput Red "Found $($healthChecks.Count) potential issues:"
-    foreach ($issue in $healthChecks) {
-        Write-ColorOutput Red "`nIssue: $($issue.Issue)"
-        Write-Host "Details: $($issue.Details)"
-        if ($issue.LatestErrorMessage) {
-            Write-Host "Latest Error Message: $($issue.LatestErrorMessage)"
-        }
-        Write-ColorOutput Yellow "Recommendation: $($issue.Recommendation)"
-    }
+    $healthChecks | Format-Table -AutoSize -Wrap
 }
 
-# Generate HTML Report
-$htmlReport = @"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>System Health Check Report</title>
-    <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-        h1 { color: #2c3e50; }
-        .issue { background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 5px; padding: 10px; margin-bottom: 10px; }
-        .issue h3 { color: #721c24; margin-top: 0; }
-        .recommendation { background-color: #fff3cd; border: 1px solid #ffeeba; border-radius: 5px; padding: 10px; }
-    </style>
-</head>
-<body>
-    <h1>System Health Check Report</h1>
-    <p>Report generated on $(Get-Date)</p>
-    $(if ($healthChecks.Count -eq 0) {
-        "<p style='color: green;'>No issues detected. System appears to be healthy.</p>"
-    } else {
-        $healthChecks | ForEach-Object {
-            @"
-            <div class="issue">
-                <h3>$($_.Issue)</h3>
-                <p>$($_.Details)</p>
-                $(if ($_.LatestErrorMessage) { "<p><strong>Latest Error Message:</strong> $($_.LatestErrorMessage)</p>" })
-                <div class="recommendation">
-                    <strong>Recommendation:</strong> $($_.Recommendation)
-                </div>
-            </div>
-"@
-        }
-    })
-</body>
-</html>
-"@
+# Save results to a variable
+$healthCheckResults = $healthChecks
 
-$reportPath = "$env:USERPROFILE\Desktop\SystemHealthReport.html"
-$htmlReport | Out-File -FilePath $reportPath -Encoding UTF8
+# Optionally, you can export the results to a CSV file
+$csvPath = "$env:USERPROFILE\Desktop\SystemHealthCheckResults.csv"
+$healthCheckResults | Export-Csv -Path $csvPath -NoTypeInformation
+Write-Host "`nResults exported to CSV: $csvPath" -ForegroundColor Green
 
-Write-Host "`nHTML report generated at: $reportPath" -ForegroundColor Green
+# You can now use $healthCheckResults variable to further process or analyze the data
 
