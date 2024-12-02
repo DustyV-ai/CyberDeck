@@ -1,0 +1,97 @@
+import subprocess
+import ipaddress
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def check_powershell_remoting(ip):
+    try:
+        result = subprocess.run(["powershell", f"Test-WSMan -ComputerName {ip}"], capture_output=True, text=True, timeout=5)
+        return "PowerShell Remoting" if result.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        return None
+
+def check_psexec(ip):
+    try:
+        result = subprocess.run(["psexec", f"\\\\{ip}", "cmd", "/c", "echo Test"], capture_output=True, text=True, timeout=5)
+        return "PsExec" if result.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        return None
+    except FileNotFoundError:
+        print("PsExec not found. Make sure it's installed and in your PATH.")
+        return None
+
+def check_winrm(ip):
+    try:
+        result = subprocess.run(["winrm", "id", "-r:http://{ip}:5985"], capture_output=True, text=True, timeout=5)
+        return "WinRM" if result.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        return None
+
+def check_host(ip):
+    methods = []
+    for check in [check_powershell_remoting, check_psexec, check_winrm]:
+        method = check(ip)
+        if method:
+            methods.append(method)
+    return ip, methods
+
+def scan_network(subnet):
+    network = ipaddress.ip_network(subnet)
+    results = {}
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_ip = {executor.submit(check_host, str(ip)): ip for ip in network.hosts()}
+        for future in as_completed(future_to_ip):
+            ip, methods = future.result()
+            if methods:
+                results[ip] = methods
+
+    return results
+
+def main():
+    subnet = input("Enter the subnet to scan (e.g., 192.168.1.0/24): ")
+    print("Scanning network... This may take a while.")
+    
+    results = scan_network(subnet)
+
+    if not results:
+        print("No accessible hosts found.")
+        return
+
+    print("\nAccessible hosts and available methods:")
+    for ip, methods in results.items():
+        print(f"{ip}: {', '.join(methods)}")
+
+    target_ip = input("\nEnter the IP of the target host: ")
+    if target_ip not in results:
+        print("The selected host is not accessible.")
+        return
+
+    print(f"\nAvailable methods for {target_ip}:")
+    for i, method in enumerate(results[target_ip], 1):
+        print(f"{i}. {method}")
+
+    method_choice = int(input("Select a method (enter the number): ")) - 1
+    selected_method = results[target_ip][method_choice]
+
+    print(f"\nYou selected: {selected_method}")
+
+    action_type = input("Do you want to run a command, script, or install a file? (command/script/file): ").lower()
+
+    if action_type == "command":
+        command = input("Enter the command to run: ")
+        print(f"Running command on {target_ip} using {selected_method}: {command}")
+        # Here you would implement the logic to run the command using the selected method
+    elif action_type == "script":
+        script_path = input("Enter the path to the script: ")
+        print(f"Running script on {target_ip} using {selected_method}: {script_path}")
+        # Here you would implement the logic to run the script using the selected method
+    elif action_type == "file":
+        file_path = input("Enter the path to the installation file: ")
+        print(f"Installing file on {target_ip} using {selected_method}: {file_path}")
+        # Here you would implement the logic to install the file using the selected method
+    else:
+        print("Invalid action type selected.")
+
+if __name__ == "__main__":
+    main()
