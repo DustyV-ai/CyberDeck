@@ -1,0 +1,81 @@
+# Import required modules
+Import-Module ExchangeOnlineManagement
+Import-Module Microsoft.Graph.Identity.SignIns
+
+# Function to ensure module is installed and imported
+function Ensure-Module {
+    param (
+        [string]$ModuleName,
+        [string]$MinimumVersion = ""
+    )
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Host "Installing module $ModuleName..."
+        Install-Module -Name $ModuleName -Force -AllowClobber -Scope CurrentUser
+    }
+
+    Import-Module $ModuleName -Force
+}
+
+# Ensure required modules are available
+Ensure-Module -ModuleName ExchangeOnlineManagement
+Ensure-Module -ModuleName Microsoft.Graph.Identity.SignIns
+
+# Connect to required services
+Connect-ExchangeOnline
+Connect-MgGraph -Scopes "AuditLog.Read.All", "Directory.Read.All"
+
+# Function to get login details
+function Get-LoginDetails {
+    param (
+        [string]$IpAddress,
+        [datetime]$StartDate,
+        [datetime]$EndDate
+    )
+
+    $filter = "ipAddress eq '$IpAddress'"
+
+    $signIns = Get-MgAuditLogSignIn -Filter $filter -All
+
+    $relevantSignIns = $signIns | Where-Object { $_.CreatedDateTime -ge $StartDate -and $_.CreatedDateTime -le $EndDate }
+
+    $results = $relevantSignIns | ForEach-Object {
+        [PSCustomObject]@{
+            UserPrincipalName = $_.UserPrincipalName
+            AppDisplayName = $_.AppDisplayName
+            ClientAppUsed = $_.ClientAppUsed
+            IpAddress = $_.IpAddress
+            Location = "$($_.Location.City), $($_.Location.CountryOrRegion)"
+            DeviceDetail = $_.DeviceDetail.Browser
+            LoginTime = $_.CreatedDateTime
+            Status = $_.Status.ErrorCode
+            IsInteractive = $_.IsInteractive
+            RiskLevelAggregated = $_.RiskLevelAggregated
+            RiskLevelDuringSignIn = $_.RiskLevelDuringSignIn
+            RiskState = $_.RiskState
+            MfaDetail = $_.MfaDetail.AuthMethod
+            ConditionalAccessStatus = $_.ConditionalAccessStatus
+        }
+    }
+
+    return $results
+}
+
+# Main execution
+$ipAddress = Read-Host "Enter the IP address to check"
+$startDate = (Get-Date).AddDays(-30)  # Default to last 30 days
+$endDate = Get-Date
+
+$loginDetails = Get-LoginDetails -IpAddress $ipAddress -StartDate $startDate -EndDate $endDate
+
+if ($loginDetails) {
+    $loginDetails | Format-Table -AutoSize
+    $loginDetails | Export-Csv -Path "LoginDetails_$ipAddress.csv" -NoTypeInformation
+    Write-Host "Login details exported to LoginDetails_$ipAddress.csv"
+} else {
+    Write-Host "No login details found for the specified IP address in the given time range."
+}
+
+# Disconnect from services
+Disconnect-ExchangeOnline -Confirm:$false
+Disconnect-MgGraph
