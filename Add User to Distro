@@ -1,0 +1,170 @@
+# Import the Exchange Online Management module
+if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+    Write-Host "ExchangeOnlineManagement module is not installed. Attempting to install..."
+    try {
+        Install-Module -Name ExchangeOnlineManagement -Force -AllowClobber -Scope CurrentUser
+    }
+    catch {
+        Write-Host "Failed to install ExchangeOnlineManagement module. Error: $_" -ForegroundColor Red
+        exit
+    }
+}
+
+Import-Module ExchangeOnlineManagement
+
+# Connect to Exchange Online
+try {
+    Connect-ExchangeOnline -ErrorAction Stop
+}
+catch {
+    Write-Host "Failed to connect to Exchange Online. Error: $_" -ForegroundColor Red
+    exit
+}
+
+# Function to display menu and get user choice
+function Show-Menu {
+    param (
+        [string]$Title = 'Distribution Group Management'
+    )
+    Clear-Host
+    Write-Host "================ $Title ================"
+    
+    Write-Host "1: List all distribution groups"
+    Write-Host "2: Add user to a distribution group"
+    Write-Host "3: Exit"
+}
+
+function List-DistributionGroups {
+    try {
+        $groups = Get-DistributionGroup -ResultSize Unlimited | Select-Object Name, PrimarySmtpAddress
+        if ($groups.Count -eq 0) {
+            Write-Host "No distribution groups found." -ForegroundColor Yellow
+        } else {
+            $groups | Format-Table -AutoSize
+        }
+    }
+    catch {
+        Write-Host "Error retrieving distribution groups: $_" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to continue"
+}
+
+function Add-UserToGroup {
+    $userEmail = Read-Host "Enter the user's email address or UPN"
+    
+    # Verify user exists
+    try {
+        $user = Get-Recipient $userEmail -ErrorAction Stop
+    }
+    catch {
+        Write-Host "User not found. Please check the email address or UPN and try again." -ForegroundColor Red
+        Read-Host "Press Enter to continue"
+        return
+    }
+    
+    try {
+        $groupsResult = Get-AccessibleDistributionGroups
+        $groups = $groupsResult.AccessibleGroups
+        $inaccessibleGroups = $groupsResult.InaccessibleGroups
+
+        if ($groups.Count -eq 0) {
+            Write-Host "No accessible distribution groups found." -ForegroundColor Yellow
+            if ($inaccessibleGroups.Count -gt 0) {
+                Write-Host "The following groups were found but are not accessible:" -ForegroundColor Yellow
+                $inaccessibleGroups | ForEach-Object { Write-Host "- $_" -ForegroundColor Yellow }
+            }
+            Read-Host "Press Enter to continue"
+            return
+        }
+        
+        Write-Host "Available Distribution Groups:"
+        for ($i = 0; $i -lt $groups.Count; $i++) {
+            Write-Host "$($i+1): $($groups[$i].Name)"
+        }
+
+        if ($inaccessibleGroups.Count -gt 0) {
+            Write-Host "`nThe following groups were found but are not accessible:" -ForegroundColor Yellow
+            $inaccessibleGroups | ForEach-Object { Write-Host "- $_" -ForegroundColor Yellow }
+        }
+        
+        $selection = Read-Host "`nEnter the number of the group you want to add the user to"
+        if ([int]::TryParse($selection, [ref]$null)) {
+            $index = [int]$selection - 1
+            if ($index -ge 0 -and $index -lt $groups.Count) {
+                $selectedGroup = $groups[$index].Name
+                
+                try {
+                    $isMember = Get-DistributionGroupMember -Identity $selectedGroup | Where-Object {$_.PrimarySmtpAddress -eq $user.PrimarySmtpAddress}
+                    if ($isMember) {
+                        Write-Host "User is already a member of this group." -ForegroundColor Yellow
+                    } else {
+                        Add-DistributionGroupMember -Identity $selectedGroup -Member $userEmail -ErrorAction Stop
+                        Write-Host "User $userEmail has been added to the group $selectedGroup successfully." -ForegroundColor Green
+                    }
+                }
+                catch {
+                    Write-Host "Error adding user to group: $_" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "Invalid selection. Please enter a number between 1 and $($groups.Count)." -ForegroundColor Red
+            }
+        } else {
+            Write-Host "Invalid input. Please enter a number." -ForegroundColor Red
+        }
+    }
+    catch {
+        Write-Host "An error occurred: $_" -ForegroundColor Red
+    }
+    
+    Read-Host "Press Enter to continue"
+}
+
+function Get-AccessibleDistributionGroups {
+    $accessibleGroups = @()
+    $inaccessibleGroups = @()
+    $allGroups = Get-DistributionGroup -ResultSize Unlimited
+    foreach ($group in $allGroups) {
+        try {
+            Get-DistributionGroupMember -Identity $group.Name -ResultSize 1 -ErrorAction Stop | Out-Null
+            $accessibleGroups += $group
+        }
+        catch {
+            $inaccessibleGroups += $group.Name
+        }
+    }
+    return @{
+        AccessibleGroups = $accessibleGroups
+        InaccessibleGroups = $inaccessibleGroups
+    }
+}
+
+# Main script
+do {
+    Show-Menu
+    $input = Read-Host "Please make a selection"
+    switch ($input) {
+        '1' {
+            List-DistributionGroups
+        }
+        '2' {
+            Add-UserToGroup
+        }
+        '3' {
+            Write-Host "Exiting..."
+            break
+        }
+        default {
+            Write-Host "Invalid selection. Please try again." -ForegroundColor Yellow
+            Read-Host "Press Enter to continue"
+        }
+    }
+} while ($input -ne '3')
+
+# Disconnect from Exchange Online
+try {
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
+    Write-Host "Successfully disconnected from Exchange Online." -ForegroundColor Green
+}
+catch {
+    Write-Host "Error disconnecting from Exchange Online: $_" -ForegroundColor Red
+}
