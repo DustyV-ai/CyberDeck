@@ -1,0 +1,83 @@
+# Function to check and install modules
+function Ensure-Module {
+    param (
+        [string]$ModuleName,
+        [string]$MinimumVersion = ""
+    )
+
+    $module = Get-Module -ListAvailable -Name $ModuleName
+
+    if (-not $module) {
+        Write-Host "Module $ModuleName is not installed. Attempting to install..."
+        try {
+            Install-Module -Name $ModuleName -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+            Write-Host "Module $ModuleName installed successfully."
+        }
+        catch {
+            Write-Error "Failed to install module $ModuleName. Error: $_"
+            return $false
+        }
+    }
+    elseif ($MinimumVersion -and ($module.Version -lt [Version]$MinimumVersion)) {
+        Write-Host "Module $ModuleName is installed but does not meet the minimum version requirement. Attempting to update..."
+        try {
+            Update-Module -Name $ModuleName -Force -ErrorAction Stop
+            Write-Host "Module $ModuleName updated successfully."
+        }
+        catch {
+            Write-Error "Failed to update module $ModuleName. Error: $_"
+            return $false
+        }
+    }
+    else {
+        Write-Host "Module $ModuleName is already installed and up to date."
+    }
+
+    Import-Module $ModuleName -Force
+    return $true
+}
+
+# List of required modules with their minimum versions
+$requiredModules = @(
+    @{Name="ExchangeOnlineManagement"; Version="2.0.5"},
+    @{Name="Microsoft.Graph.Identity.DirectoryManagement"; Version="1.9.2"},
+    @{Name="Microsoft.Graph.Identity.SignIns"; Version="1.9.2"},
+    @{Name="Microsoft.Graph.Users"; Version="1.9.2"}
+)
+
+# Check and install required modules
+$allModulesInstalled = $true
+foreach ($module in $requiredModules) {
+    if (-not (Ensure-Module -ModuleName $module.Name -MinimumVersion $module.Version)) {
+        $allModulesInstalled = $false
+    }
+}
+
+if (-not $allModulesInstalled) {
+    Write-Error "Not all required modules could be installed. Please check the error messages above and install the missing modules manually."
+    exit
+}
+
+# Connect to required services
+try {
+    Connect-ExchangeOnline -ErrorAction Stop
+    Connect-MgGraph -Scopes "User.ReadWrite.All", "AuditLog.Read.All", "MailboxSettings.Read", "Mail.Read" -ErrorAction Stop
+}
+catch {
+    Write-Error "Failed to connect to required services. Error: $_"
+    exit
+}
+
+# ... [Rest of the script remains the same] ...
+
+# Main execution
+$compromisedUser = Read-Host "Enter the compromised user's email address"
+
+Immediate-Containment -UserPrincipalName $compromisedUser
+Investigate-Account -UserPrincipalName $compromisedUser
+Remove-Threats -UserPrincipalName $compromisedUser
+Assess-Impact -UserPrincipalName $compromisedUser
+
+# Disconnect from services
+Disconnect-ExchangeOnline -Confirm:$false
+Disconnect-MgGraph
