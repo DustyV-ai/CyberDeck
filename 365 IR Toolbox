@@ -1,0 +1,469 @@
+# Check and install required modules
+$requiredModules = @(
+    "ExchangeOnlineManagement",
+    "Microsoft.Graph.Authentication",
+    "Microsoft.Graph.Identity.SignIns",
+    "Microsoft.Graph.Users"
+)
+
+foreach ($module in $requiredModules) {
+    if (!(Get-Module -ListAvailable -Name $module)) {
+        Write-Host "Module $module is not installed. Attempting to install..."
+        try {
+            Install-Module -Name $module -Force -AllowClobber -Scope CurrentUser
+            Write-Host "Module $module installed successfully."
+        }
+        catch {
+            Write-Host "Failed to install module $module. Please install it manually using the following command:"
+            Write-Host "Install-Module -Name $module -Force -AllowClobber -Scope CurrentUser"
+            exit
+        }
+    }
+}
+
+# Import required modules
+Import-Module ExchangeOnlineManagement
+Import-Module Microsoft.Graph.Authentication
+Import-Module Microsoft.Graph.Identity.SignIns
+Import-Module Microsoft.Graph.Users
+
+# Configuration
+$script:LogFile = "ComplianceSearchLog.txt"
+$script:SearchQueryTemplate = "from:{0}"
+$script:MaxRetries = 3
+$script:RetryDelay = 5
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('Info', 'Warning', 'Error')]
+        [string]$Level = 'Info'
+    )
+    $logMessage = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - [$Level] $Message"
+    Add-Content -Path $script:LogFile -Value $logMessage
+    switch ($Level) {
+        'Info' { Write-Host $logMessage -ForegroundColor Green }
+        'Warning' { Write-Host $logMessage -ForegroundColor Yellow }
+        'Error' { Write-Host $logMessage -ForegroundColor Red }
+    }
+}
+
+function Test-ExchangeConnection {
+    $connectedToSCC = Get-PSSession | Where-Object {$_.ComputerName -eq "ps.compliance.protection.outlook.com" -and $_.State -eq "Opened"}
+    if (-not $connectedToSCC) {
+        Write-Log "Not connected to Security & Compliance Center. Attempting to connect..." -Level Warning
+        try {
+            Connect-IPPSSession -ErrorAction Stop
+            Write-Log "Successfully connected to Security & Compliance Center." -Level Info
+        }
+        catch {
+            Write-Log "Failed to connect to Security & Compliance Center: $_" -Level Error
+            return $false
+        }
+    }
+    return $true
+}
+
+function New-UniqueSearchName {
+    param([string]$BaseName)
+    $searchName = $BaseName
+    $counter = 1
+    while (Get-ComplianceSearch -Identity $searchName -ErrorAction SilentlyContinue) {
+        $searchName = "${BaseName}_$counter"
+        $counter++
+    }
+    return $searchName
+}
+
+function Start-ComplianceSearch {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$")]
+        [string]$EmailAddress
+    )
+
+    $baseSearchName = "Search_$($EmailAddress.Replace('@','_'))"
+    $searchQuery = $script:SearchQueryTemplate -f $EmailAddress
+
+    try {
+        if (-not (Test-ExchangeConnection)) {
+            throw "Unable to establish connection to Security & Compliance Center."
+        }
+
+        $searchName = New-UniqueSearchName -BaseName $baseSearchName
+        Write-Log "Creating compliance search: $searchName" -Level Info
+
+        $retryCount = 0
+        do {
+            try {
+                $search = New-ComplianceSearch -Name $searchName -ExchangeLocation All -ContentMatchQuery $searchQuery -ErrorAction Stop
+                break
+            }
+            catch {
+                $retryCount++
+                if ($retryCount -ge $script:MaxRetries) {
+                    throw
+                }
+                Write-Log "Attempt $retryCount failed. Retrying in $script:RetryDelay seconds..." -Level Warning
+                Start-Sleep -Seconds $script:RetryDelay
+            }
+        } while ($true)
+
+        Write-Log "Starting compliance search..." -Level Info
+        Start-ComplianceSearch -Identity $searchName -ErrorAction Stop
+
+        Write-Log "Waiting for search to complete..." -Level Info
+        $progressParams = @{
+            Activity = "Compliance Search"
+            Status = "Searching..."
+            PercentComplete = 0
+        }
+        do {
+            Start-Sleep -Seconds 5
+            $searchStatus = Get-ComplianceSearch -Identity $searchName -ErrorAction Stop
+            $progressParams.PercentComplete = [math]::Min($searchStatus.PercentComplete, 100)
+            Write-Progress @progressParams
+        } while ($searchStatus.Status -ne "Completed")
+
+        Write-Progress -Activity "Compliance Search" -Completed
+
+        $results = Get-ComplianceSearch -Identity $searchName -ErrorAction Stop
+        if ($results) {
+            Write-Log "Search completed. Found $($results.Items) items." -Level Info
+
+            $purgeConfirm = Read-Host "Do you want to purge these items? (Y/N)"
+            if ($purgeConfirm -eq "Y") {
+                $purgeAction = New-ComplianceSearchAction -SearchName $searchName -Purge -PurgeType HardDelete -Confirm:$false -ErrorAction Stop
+                if ($purgeAction) {
+                    Write-Log "Purge action initiated." -Level Info
+                } else {
+                    Write-Log "Failed to initiate purge action." -Level Error
+                }
+            }
+        } else {
+            Write-Log "No results found or unable to retrieve results." -Level Warning
+        }
+    }
+    catch {
+        Write-Log "Error performing compliance search: $_" -Level Error
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+    }
+}
+
+function Remove-OldSearches {
+    param([int]$DaysOld = 30)
+    $cutoffDate = (Get-Date).AddDays(-$DaysOld)
+    $oldSearches = Get-ComplianceSearch | Where-Object { $_.CreatedDate -lt $cutoffDate }
+    foreach ($search in $oldSearches) {
+        Write-Log "Removing old search: $($search.Name)" -Level Info
+        Remove-ComplianceSearch -Identity $search.Name -Confirm:$false
+    }
+}
+
+function Block-Domain {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^(?!:\/\/)(?=.{1,255}$)((.{1,63}\.){1,127}(?![0-9]*$)[a-z0-9-]+\.?)$")]
+        [string]$DomainName
+    )
+    try {
+        $policyName = "BlockedDomains"
+        $existingPolicy = Get-HostedContentFilterPolicy -Identity $policyName -ErrorAction SilentlyContinue
+
+        if ($existingPolicy) {
+            if ($existingPolicy.BlockedSenderDomains -contains $DomainName) {
+                Write-Log "Domain $DomainName is already blocked." -Level Warning
+                return
+            }
+
+            $updatedBlockedDomains = $existingPolicy.BlockedSenderDomains + $DomainName
+            Set-HostedContentFilterPolicy -Identity $policyName -BlockedSenderDomains $updatedBlockedDomains
+            Write-Log "Domain $DomainName has been added to the existing blocked domains list." -Level Info
+        } else {
+            New-HostedContentFilterPolicy -Name $policyName -BlockedSenderDomains $DomainName
+            Write-Log "New policy created with domain $DomainName blocked." -Level Info
+        }
+
+        $existingRules = Get-HostedContentFilterRule | Where-Object {$_.HostedContentFilterPolicy -eq $policyName}
+
+        if ($existingRules) {
+            Write-Log "Existing rule(s) found for the blocked domains policy. No changes made to rules." -Level Info
+        } else {
+            New-HostedContentFilterRule -Name "Default Blocked Domains Rule" -HostedContentFilterPolicy $policyName -RecipientDomainIs ((Get-AcceptedDomain).DomainName)
+            Write-Log "Created new rule associated with the blocked domains policy." -Level Info
+        }
+    }
+    catch {
+        Write-Log "Error blocking domain: $_" -Level Error
+    }
+}
+
+function Search-UserSignInsForIP {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")]
+        [string]$IPAddress
+    )
+
+    $maxRetries = 3
+    $retryDelay = 5
+
+    for ($i = 0; $i -lt $maxRetries; $i++) {
+        try {
+            # Connect to Microsoft Graph if not already connected
+            if (-not (Get-MgContext)) {
+                Write-Log "Connecting to Microsoft Graph..." -Level Info
+                Connect-MgGraph -Scopes "AuditLog.Read.All" -ErrorAction Stop
+            }
+
+            Write-Log "Searching for sign-ins from IP address: $IPAddress over the past week (Attempt $($i+1))" -Level Info
+
+            # Calculate date one week ago
+            $oneWeekAgo = (Get-Date).AddDays(-7).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+            $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=ipAddress eq '$IPAddress' and createdDateTime ge $oneWeekAgo&`$top=100&`$orderby=createdDateTime desc"
+            $signIns = Invoke-MgGraphRequest -Uri $uri -Method Get -ErrorAction Stop
+
+            if ($signIns.value) {
+                $signInCount = $signIns.value.Count
+                Write-Log "Found $signInCount sign-in(s) from IP address $IPAddress in the past week:" -Level Info
+                foreach ($signIn in $signIns.value) {
+                    $logInfo = @"
+User: $($signIn.userPrincipalName)
+Time: $($signIn.createdDateTime)
+Status: $($signIn.status.errorCode)
+Application: $($signIn.appDisplayName)
+Client App: $($signIn.clientAppUsed)
+Device: $($signIn.deviceDetail.displayName)
+Location: $($signIn.location.city), $($signIn.location.countryOrRegion)
+Risk Level: $($signIn.riskLevel)
+"@
+                    Write-Log $logInfo -Level Info
+                    Write-Log "------------------------" -Level Info
+                }
+            } else {
+                Write-Log "No sign-ins found from IP address $IPAddress in the past week" -Level Warning
+            }
+
+            # If we reach here, the operation was successful, so we break out of the retry loop
+            break
+        }
+        catch {
+            Write-Log "Error searching for sign-ins (Attempt $($i+1)): $_" -Level Error
+            Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+
+            if ($i -lt $maxRetries - 1) {
+                Write-Log "Retrying in $retryDelay seconds..." -Level Info
+                Start-Sleep -Seconds $retryDelay
+            } else {
+                Write-Log "Max retries reached. Operation failed." -Level Error
+            }
+        }
+    }
+}
+
+
+
+
+function Revoke-UserSessionTokens {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$")]
+        [string]$UserPrincipalName
+    )
+
+    try {
+        # Connect to Microsoft Graph if not already connected
+        if (-not (Get-MgContext)) {
+            Connect-MgGraph -Scopes "User.ReadWrite.All" -ErrorAction Stop
+        }
+
+        Write-Log "Revoking session tokens for user: $UserPrincipalName" -Level Info
+
+        # Get the user's Object ID
+        $user = Get-MgUser -UserId $UserPrincipalName -ErrorAction Stop
+        
+        # Revoke all refresh tokens for the user
+        $revokeTokenUri = "https://graph.microsoft.com/v1.0/users/$($user.Id)/revokeSignInSessions"
+        Invoke-MgGraphRequest -Method POST -Uri $revokeTokenUri -ErrorAction Stop
+
+        Write-Log "Successfully revoked session tokens for user: $UserPrincipalName" -Level Info
+    }
+    catch {
+        Write-Log "Error revoking session tokens: $_" -Level Error
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+    }
+}
+
+
+function Reset-UserPassword {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$")]
+        [string]$UserPrincipalName
+    )
+
+    try {
+        # Connect to Microsoft Graph if not already connected
+        if (-not (Get-MgContext)) {
+            Connect-MgGraph -Scopes "User.ReadWrite.All" -ErrorAction Stop
+        }
+
+        Write-Log "Resetting password for user: $UserPrincipalName" -Level Info
+
+        $passwordProfile = @{
+            ForceChangePasswordNextSignIn = $true
+            Password = [System.Web.Security.Membership]::GeneratePassword(16,3)
+        }
+
+        Update-MgUser -UserId $UserPrincipalName -PasswordProfile $passwordProfile -ErrorAction Stop
+
+        Write-Log "Successfully reset password for user: $UserPrincipalName" -Level Info
+        Write-Log "Temporary password: $($passwordProfile.Password)" -Level Info
+        Write-Host "Temporary password: $($passwordProfile.Password)" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Log "Error resetting user password: $_" -Level Error
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+    }
+}
+
+function Get-UserInboxRules {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$")]
+        [string]$UserPrincipalName
+    )
+
+    try {
+        Write-Log "Retrieving inbox rules for user: $UserPrincipalName" -Level Info
+
+        # Connect to Exchange Online if not already connected
+        if (-not (Get-PSSession | Where-Object {$_.ConfigurationName -eq "Microsoft.Exchange"})) {
+            Connect-ExchangeOnline -ErrorAction Stop
+        }
+
+        $rules = Get-InboxRule -Mailbox $UserPrincipalName -ErrorAction Stop
+
+        if ($rules) {
+            Write-Log "Found $($rules.Count) inbox rule(s) for $UserPrincipalName" -Level Info
+            foreach ($rule in $rules) {
+                Write-Log "Rule ID: $($rule.Identity) | Name: $($rule.Name) | Enabled: $($rule.Enabled)" -Level Info
+            }
+        } else {
+            Write-Log "No inbox rules found for $UserPrincipalName" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "Error retrieving inbox rules: $_" -Level Error
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+    }
+}
+
+function Remove-UserInboxRule {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidatePattern("^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$")]
+        [string]$UserPrincipalName,
+
+        [Parameter(Mandatory=$true)]
+        [string]$RuleId
+    )
+
+    try {
+        Write-Log "Attempting to remove inbox rule $RuleId for user: $UserPrincipalName" -Level Info
+
+        # Connect to Exchange Online if not already connected
+        if (-not (Get-PSSession | Where-Object {$_.ConfigurationName -eq "Microsoft.Exchange"})) {
+            Connect-ExchangeOnline -ErrorAction Stop
+        }
+
+        # Get all rules for the mailbox
+        $rules = Get-InboxRule -Mailbox $UserPrincipalName -ErrorAction Stop
+
+        # Find the specific rule
+        $ruleToRemove = $rules | Where-Object { $_.Identity -eq $RuleId }
+
+        if ($ruleToRemove) {
+            # Remove the rule
+            $ruleToRemove | Remove-InboxRule -Confirm:$false -ErrorAction Stop
+            Write-Log "Successfully removed inbox rule $RuleId for $UserPrincipalName" -Level Info
+        } else {
+            Write-Log "Inbox rule $RuleId not found for $UserPrincipalName" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "Error removing inbox rule: $_" -Level Error
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+    }
+}
+
+# Main menu
+do {
+    Write-Host "`n1. Perform Compliance Search"
+    Write-Host "2. Clean Up Old Searches"
+    Write-Host "3. Block Domain"
+    Write-Host "4. Search User Sign-Ins for IP"
+    Write-Host "5. Revoke User Session Tokens"
+    Write-Host "6. Reset User Password"
+    Write-Host "7. List User Inbox Rules"
+    Write-Host "8. Remove User Inbox Rule"
+    Write-Host "9. Exit"
+    $choice = Read-Host "Enter your choice (1-9)"
+
+    switch ($choice) {
+        "1" {
+            $emailAddress = Read-Host "Enter the email address for compliance search"
+            Start-ComplianceSearch -EmailAddress $emailAddress
+        }
+        "2" {
+            $days = Read-Host "Enter the number of days old (default 30)"
+            if ([string]::IsNullOrWhiteSpace($days)) { $days = 30 }
+            Remove-OldSearches -DaysOld $days
+        }
+        "3" {
+            $domainName = Read-Host "Enter the domain name to block"
+            Block-Domain -DomainName $domainName
+        }
+        "4" {
+            $ipAddress = Read-Host "Enter the IP address to search for"
+            Search-UserSignInsForIP -IPAddress $ipAddress
+        }
+        "5" {
+            $userPrincipalName = Read-Host "Enter the user's UPN or email address"
+            Revoke-UserSessionTokens -UserPrincipalName $userPrincipalName
+        }
+        "6" {
+            $userPrincipalName = Read-Host "Enter the user's UPN or email address"
+            Reset-UserPassword -UserPrincipalName $userPrincipalName
+        }
+        "7" {
+            $userPrincipalName = Read-Host "Enter the user's UPN or email address"
+            Get-UserInboxRules -UserPrincipalName $userPrincipalName
+        }
+        "8" {
+            $userPrincipalName = Read-Host "Enter the user's UPN or email address"
+            $ruleId = Read-Host "Enter the ID of the inbox rule to remove"
+            Remove-UserInboxRule -UserPrincipalName $userPrincipalName -RuleId $ruleId
+        }
+        "9" {
+            Write-Host "Exiting..."
+            break
+        }
+        default {
+            Write-Log "Invalid choice. Please try again." -Level Warning
+        }
+    }
+} while ($choice -ne "9")
+
+# Disconnect sessions
+try {
+    Disconnect-ExchangeOnline -Confirm:$false
+    Disconnect-MgGraph -ErrorAction SilentlyContinue
+    Write-Log "Successfully disconnected from Exchange Online and Microsoft Graph." -Level Info
+}
+catch {
+    Write-Log "Error disconnecting from sessions: $_" -Level Error
+}
+
+Write-Host "Script execution completed. Check the log file for details: $script:LogFile"
