@@ -407,6 +407,62 @@ function Remove-UserInboxRule {
     }
 }
 
+function Get-MessageTraceDetails {
+    # Check if ExchangeOnline module is installed and connected
+    if (!(Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+        Write-Host "ExchangeOnline module is not installed. Installing now..."
+        Install-Module -Name ExchangeOnlineManagement -Force -AllowClobber
+    }
+
+    if (!(Get-PSSession | Where-Object {$_.ConfigurationName -eq "Microsoft.Exchange"})) {
+        Write-Host "Connecting to Exchange Online..."
+        Connect-ExchangeOnline
+    }
+
+    # Get user input
+    $emailAddress = Read-Host "Enter the email address for the message trace"
+    $direction = Read-Host "Is this for the sender or receiver? (S/R)"
+
+    # Validate input
+    if (-not ($direction -eq 'S' -or $direction -eq 'R')) {
+        Write-Host "Invalid input. Please enter 'S' for sender or 'R' for receiver."
+        return
+    }
+
+    # Set up parameters for message trace
+$params = @{
+    StartDate = (Get-Date).AddDays(-10)  # Last 10 days
+    EndDate = Get-Date
+    PageSize = 5000
+}
+
+    if ($direction -eq 'S') {
+        $params.Add("SenderAddress", $emailAddress)
+    } else {
+        $params.Add("RecipientAddress", $emailAddress)
+    }
+
+    # Run message trace
+    Write-Host "Running message trace..."
+    $results = Get-MessageTrace @params
+
+    # Display results
+    if ($results) {
+        Write-Host "Message trace results:"
+        $results | Format-Table -AutoSize -Property Received, SenderAddress, RecipientAddress, Subject, Status, ToIP, FromIP, Size, MessageId
+        
+        # Offer to export results to CSV
+        $exportChoice = Read-Host "Do you want to export these results to a CSV file? (Y/N)"
+        if ($exportChoice -eq 'Y') {
+            $exportPath = Join-Path -Path $env:USERPROFILE -ChildPath "Desktop\MessageTraceResults.csv"
+            $results | Export-Csv -Path $exportPath -NoTypeInformation
+            Write-Host "Results exported to: $exportPath"
+        }
+    } else {
+        Write-Host "No messages found matching the criteria."
+    }
+}
+
 # Main menu
 do {
     Write-Host "`n1. Perform Compliance Search"
@@ -417,8 +473,9 @@ do {
     Write-Host "6. Reset User Password"
     Write-Host "7. List User Inbox Rules"
     Write-Host "8. Remove User Inbox Rule"
-    Write-Host "9. Exit"
-    $choice = Read-Host "Enter your choice (1-9)"
+    Write-Host "9. Run Message Trace"
+    Write-Host "10. Exit"
+    $choice = Read-Host "Enter your choice (1-10)"
 
     switch ($choice) {
         "1" {
@@ -456,6 +513,9 @@ do {
             Remove-UserInboxRule -UserPrincipalName $userPrincipalName -RuleId $ruleId
         }
         "9" {
+            Get-MessageTraceDetails
+        }
+        "10" {
             Write-Host "Exiting..."
             break
         }
@@ -463,7 +523,7 @@ do {
             Write-Log "Invalid choice. Please try again." -Level Warning
         }
     }
-} while ($choice -ne "9")
+} while ($choice -ne "10")
 
 # Disconnect sessions
 try {
