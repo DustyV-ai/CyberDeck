@@ -83,7 +83,16 @@ function Start-ComplianceSearch {
     )
 
     $baseSearchName = "Search_$($EmailAddress.Replace('@','_'))"
-    $searchQuery = $script:SearchQueryTemplate -f $EmailAddress
+    
+    # Prompt for email subject
+    $emailSubject = Read-Host "Enter the email subject (press Enter to skip)"
+
+    # Modify search query based on whether a subject was provided
+    if ([string]::IsNullOrWhiteSpace($emailSubject)) {
+        $searchQuery = $script:SearchQueryTemplate -f $EmailAddress
+    } else {
+        $searchQuery = "($($script:SearchQueryTemplate -f $EmailAddress)) AND (Subject:'$emailSubject')"
+    }
 
     try {
         if (-not (Test-ExchangeConnection)) {
