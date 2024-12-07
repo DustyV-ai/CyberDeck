@@ -184,7 +184,7 @@ Invoke-SafeCommand -Command {
 Write-Host "Checking for Outdated Drivers..." -ForegroundColor Cyan
 Invoke-SafeCommand -Command {
     $outdatedDrivers = Get-WmiObject Win32_PnPSignedDriver | 
-                       Where-Object { $_.DriverDate -lt (Get-Date).AddYears(-2) } |
+                       Where-Object { $_.DriverDate.Substring(0, 8) -lt (Get-Date (Get-Date).AddYears(-2) -Format yyyyMMdd) } |
                        Select-Object -First 5
     if ($outdatedDrivers) {
         $healthChecks += [PSCustomObject]@{
