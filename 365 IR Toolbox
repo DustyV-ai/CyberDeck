@@ -118,7 +118,7 @@ function Start-ComplianceSearch {
             }
         } while ($true)
 
-        Write-Log "Starting compliance search..." -Level Info
+        Write-Log "Starting compliance search: $searchName" -Level Info
         Start-ComplianceSearch -Identity $searchName -ErrorAction Stop
 
         Write-Log "Waiting for search to complete..." -Level Info
@@ -162,12 +162,13 @@ function Start-ComplianceSearch {
 function Remove-OldSearches {
     param([int]$DaysOld = 30)
     $cutoffDate = (Get-Date).AddDays(-$DaysOld)
-    $oldSearches = Get-ComplianceSearch | Where-Object { $_.CreatedDate -lt $cutoffDate }
+    $oldSearches = Get-ComplianceSearch | Where-Object { $_.CreationTime -lt $cutoffDate }  # Use CreationTime instead of CreatedDate
     foreach ($search in $oldSearches) {
         Write-Log "Removing old search: $($search.Name)" -Level Info
-        Remove-ComplianceSearch -Identity $search.Name -Confirm:$false
+        Remove-ComplianceSearch -Identity $search.Name -Confirm:$false  # Use -Identity instead of -Name
     }
 }
+
 
 function Block-Domain {
     param(
@@ -315,7 +316,6 @@ function Revoke-UserSessionTokens {
         Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
     }
 }
-
 
 function Reset-UserPassword {
     param(
@@ -558,7 +558,6 @@ function Get-UniqueUserLogins {
 
     Write-Host "Unique user logins search completed for $UserPrincipalName"
 }
-
 
 # Main menu
 do {
