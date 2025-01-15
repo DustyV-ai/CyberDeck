@@ -1,0 +1,839 @@
+import socket
+import struct
+import time
+import json
+import random
+import sys
+import logging
+import subprocess
+import ipaddress
+import asyncio
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class MDNSProtocol:
+    def __init__(self):
+        self.transport = None
+        self.received_data = asyncio.Queue()
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        asyncio.create_task(self.received_data.put((data, addr)))
+
+    def error_received(self, exc):
+        logging.error(f'Error received: {exc}')
+
+    def connection_lost(self, exc):
+        logging.info("Socket closed")
+
+def create_mdns_query(service_types):
+    """Creates an mDNS query packet for multiple service types."""
+    logging.debug(f"Creating mDNS query for service types: {service_types}")
+    query_id = random.randint(0, 65535)  # Random Query ID
+    flags = 0x0100  # Standard query
+    num_questions = len(service_types)  # One question per service type
+    num_answers = 0x0000
+    num_authority_records = 0x0000
+    num_additional_records = 0x0000
+
+    # Question Section
+    query = struct.pack('!H H H H H H', query_id, flags, num_questions, num_answers, num_authority_records,
+                        num_additional_records)
+
+    for service_type in service_types:
+        question_name = service_type.encode()
+        q_type = 0x00ff  # Any Type
+        q_class = 0x0001  # Class IN
+
+        # Construct the query name by prepending each part with its length
+        query_name_packed = b''
+        parts = question_name.split(b'.')
+        for part in parts:
+            query_name_packed += struct.pack('!B', len(part)) + part
+        query_name_packed += b'\x00'  # Null terminate the query name
+
+        query += query_name_packed
+        query += struct.pack('!H H', q_type, q_class)
+
+    logging.debug(f"mDNS query packet created: {query.hex()}")
+    return query
+
+def parse_name(data, offset, original_data=None):
+    if original_data is None:
+        original_data = data
+    name = []
+    max_jumps = 10
+    jumps = 0
+    
+    while True:
+        if offset >= len(data):
+            return None, offset
+
+        length = data[offset]
+        offset += 1
+
+        if length == 0:
+            break
+
+        if (length & 0xC0) == 0xC0:
+            if offset >= len(original_data):
+                return None, offset
+            pointer = struct.unpack('!H', bytes([length & 0x3F, original_data[offset]]))[0]
+            offset += 1
+            if jumps >= max_jumps:
+                return None, offset
+            jumps += 1
+            result, _ = parse_name(original_data, pointer, original_data)
+            if result is None:
+                return None, offset
+            name.append(result)
+            break
+        else:
+            if offset + length > len(data):
+                return None, offset
+            try:
+                label = data[offset:offset + length].decode('utf-8')
+                name.append(label)
+                offset += length
+            except UnicodeDecodeError:
+                return None, offset
+
+    return '.'.join(filter(None, name)), offset
+
+def parse_txt_record(rdata):
+    """Parses a TXT record into key-value pairs."""
+    offset = 0
+    txt_pairs = {}
+    while offset < len(rdata):
+        length = rdata[offset]
+        offset += 1
+        if offset + length > len(rdata):
+            logging.error(f"Error parsing TXT record, invalid record length.")
+            break
+        txt_pair = rdata[offset: offset + length].decode('utf-8')
+        offset += length
+        if '=' in txt_pair:
+            key, value = txt_pair.split('=', 1)
+            txt_pairs[key] = value
+        # Do not add empty txt_entry values
+    logging.debug(f"Parsed TXT record: {txt_pairs}")
+    return txt_pairs
+
+def parse_mdns_response(data):
+    """Parses an mDNS response packet."""
+    logging.debug(f"Parsing mDNS response: {data.hex()}")
+    offset = 0
+    header = struct.unpack('!H H H H H H', data[:12])
+    offset += 12
+
+    num_questions = header[2]
+    num_answers = header[3]
+    num_authority_records = header[4]
+    num_additional_records = header[5]
+    records = []
+
+    logging.debug(f"mDNS response header: Questions={num_questions}, Answers={num_answers}, Authority={num_authority_records}, Additional={num_additional_records}")
+
+    # Skip questions
+    for _ in range(num_questions):
+        _, offset = parse_name(data, offset, data)
+        offset += 4  # Skip Type and Class
+
+    # Parse Answer, Authority, and Additional records
+    for section in ['Answer', 'Authority', 'Additional']:
+        num_records = [num_answers, num_authority_records, num_additional_records][['Answer', 'Authority', 'Additional'].index(section)]
+        for _ in range(num_records):
+            name, offset = parse_name(data, offset, data)
+            if name is None:
+                logging.warning(f"Failed to parse name in {section} section")
+                continue
+            
+            if offset + 10 > len(data):
+                logging.error(f"Incomplete record in {section} section")
+                break
+            
+            type, cls, ttl, rdlength = struct.unpack("!H H I H", data[offset:offset + 10])
+            offset += 10
+            
+            if offset + rdlength > len(data):
+                logging.error(f"Incomplete RDATA in {section} section")
+                break
+            
+            rdata = data[offset:offset + rdlength]
+            offset += rdlength
+
+            record = {
+                'name': name,
+                'type': type,
+                'class': cls,
+                'ttl': ttl,
+                'rdata': rdata,
+            }
+            records.append(record)
+            logging.debug(f"Parsed {section} record: {record}")
+
+    return records
+
+def handle_dns_record(device, record):
+    """Handles a single DNS record and populates device information."""
+    if record['type'] == 12:  # PTR record
+        try:
+            service_name, _ = parse_name(record['rdata'], 0, record['rdata'])
+            if service_name:
+                logging.debug(f"Parsed PTR record: {service_name}")
+                if 'services' not in device:
+                    device['services'] = []
+                if service_name not in device['services']:
+                    device['services'].append(service_name)
+            else:
+                logging.warning(f"Empty service name for PTR record: {record}")
+        except Exception as e:
+            logging.error(f"Error parsing PTR record: {e}")
+            logging.debug(f"Raw PTR record data: {record['rdata'].hex()}")
+    elif record['type'] == 33:  # SRV record
+        try:
+            if len(record['rdata']) < 6:
+                logging.error(f"SRV record too short: {record}")
+                return
+            priority, weight, port = struct.unpack("!H H H", record['rdata'][:6])
+            target, _ = parse_name(record['rdata'], 6, record['rdata'])
+            if target:
+                logging.debug(f"Parsed SRV record: priority={priority}, weight={weight}, port={port}, target={target}")
+                if 'srv_records' not in device:
+                    device['srv_records'] = []
+                srv_record = {
+                    'priority': priority,
+                    'weight': weight,
+                    'port': port,
+                    'target': target
+                }
+                if srv_record not in device['srv_records']:
+                    device['srv_records'].append(srv_record)
+            else:
+                logging.warning(f"Failed to parse target in SRV record: {record}")
+        except Exception as e:
+            logging.error(f"Error parsing SRV record: {e}")
+            logging.debug(f"Raw SRV record data: {record['rdata'].hex()}")
+    elif record['type'] == 16:  # TXT Record
+        txt_data = parse_txt_record(record['rdata'])
+        logging.debug(f"Handling TXT record for device {device}. TXT data: {txt_data}")
+        if 'txt_records' not in device:
+            device['txt_records'] = []
+        if txt_data not in device['txt_records']:
+            device['txt_records'].append(txt_data)
+    elif record['type'] == 1:  # A record (IPv4)
+        ip_address = socket.inet_ntoa(record['rdata'])
+        logging.debug(f"Handling A record for device {device}. IPv4 address: {ip_address}")
+        if 'addresses' not in device:
+            device['addresses'] = []
+        if ip_address not in device['addresses']:
+            device['addresses'].append(ip_address)
+    elif record['type'] == 28:  # AAAA record (IPv6)
+        ip_address = socket.inet_ntop(socket.AF_INET6, record['rdata'])
+        logging.debug(f"Handling AAAA record for device {device}. IPv6 address: {ip_address}")
+        if 'addresses' not in device:
+            device['addresses'] = []
+        if ip_address not in device['addresses']:
+            device['addresses'].append(ip_address)
+    else:
+        logging.warning(f"Unhandled record type: {record['type']}")
+    """Handles a single DNS record and populates device information."""
+    if record['type'] == 12:  # PTR record
+        try:
+            service_name, _ = parse_name(record['rdata'], 0, record['rdata'])
+            if service_name:
+                logging.debug(f"Parsed PTR record: {service_name}")
+                if 'services' not in device:
+                    device['services'] = []
+                if service_name not in device['services']:
+                    device['services'].append(service_name)
+            else:
+                logging.warning(f"Empty service name for PTR record: {record}")
+        except Exception as e:
+            logging.error(f"Error parsing PTR record: {e}")
+            logging.debug(f"Raw PTR record data: {record['rdata'].hex()}")
+    elif record['type'] == 33:  # SRV record
+        try:
+            if len(record['rdata']) < 6:
+                logging.error(f"SRV record too short: {record}")
+                return
+            priority, weight, port = struct.unpack("!H H H", record['rdata'][:6])
+            target, _ = parse_name(record['rdata'], 6, record['rdata'])
+            if target:
+                logging.debug(f"Parsed SRV record: priority={priority}, weight={weight}, port={port}, target={target}")
+                if 'srv_records' not in device:
+                    device['srv_records'] = []
+                device['srv_records'].append({
+                    'priority': priority,
+                    'weight': weight,
+                    'port': port,
+                    'target': target
+                })
+            else:
+                logging.warning(f"Failed to parse target in SRV record: {record}")
+        except Exception as e:
+            logging.error(f"Error parsing SRV record: {e}")
+            logging.debug(f"Raw SRV record data: {record['rdata'].hex()}")
+    elif record['type'] == 16:  # TXT Record
+        txt_data = parse_txt_record(record['rdata'])
+        logging.debug(f"Handling TXT record for device {device}. TXT data: {txt_data}")
+        if 'txt_records' not in device:
+            device['txt_records'] = []
+        if txt_data not in device['txt_records']:
+            device['txt_records'].append(txt_data)
+    elif record['type'] == 1:  # A record (IPv4)
+        ip_address = socket.inet_ntoa(record['rdata'])
+        logging.debug(f"Handling A record for device {device}. IPv4 address: {ip_address}")
+        if 'addresses' not in device:
+            device['addresses'] = []
+        if ip_address not in device['addresses']:
+            device['addresses'].append(ip_address)
+    elif record['type'] == 28:  # AAAA record (IPv6)
+        ip_address = socket.inet_ntop(socket.AF_INET6, record['rdata'])
+        logging.debug(f"Handling AAAA record for device {device}. IPv6 address: {ip_address}")
+        if 'addresses' not in device:
+            device['addresses'] = []
+        if ip_address not in device['addresses']:
+            device['addresses'].append(ip_address)
+    else:
+        logging.warning(f"Unhandled record type: {record['type']}")
+    """Handles a single DNS record and populates device information."""
+    if record['type'] == 12:  # PTR record
+        try:
+            service_name, _ = parse_name(record['rdata'], 0, record['rdata'])
+            if service_name:
+                logging.debug(f"Parsed PTR record: {service_name}")
+                if 'services' not in device:
+                    device['services'] = []
+                if service_name not in device['services']:
+                    device['services'].append(service_name)
+            else:
+                logging.warning(f"Empty service name for PTR record: {record}")
+        except Exception as e:
+            logging.error(f"Error parsing PTR record: {e}")
+            logging.debug(f"Raw PTR record data: {record['rdata'].hex()}")
+    elif record['type'] == 33:  # SRV record
+        try:
+            if len(record['rdata']) < 6:
+                logging.error(f"SRV record too short: {record}")
+                return
+            priority, weight, port = struct.unpack("!H H H", record['rdata'][:6])
+            target, _ = parse_name(record['rdata'], 6, record['rdata'])
+            if target:
+                logging.debug(f"Parsed SRV record: priority={priority}, weight={weight}, port={port}, target={target}")
+                if 'srv_records' not in device:
+                    device['srv_records'] = []
+                device['srv_records'].append({
+                    'priority': priority,
+                    'weight': weight,
+                    'port': port,
+                    'target': target
+                })
+            else:
+                logging.warning(f"Failed to parse target in SRV record: {record}")
+        except Exception as e:
+            logging.error(f"Error parsing SRV record: {e}")
+            logging.debug(f"Raw SRV record data: {record['rdata'].hex()}")
+    elif record['type'] == 16:  # TXT Record
+        txt_data = parse_txt_record(record['rdata'])
+        logging.debug(f"Handling TXT record for device {device}. TXT data: {txt_data}")
+        if 'txt_records' not in device:
+            device['txt_records'] = []
+        if txt_data not in device['txt_records']:
+            device['txt_records'].append(txt_data)
+    elif record['type'] == 1:  # A record (IPv4)
+        ip_address = socket.inet_ntoa(record['rdata'])
+        logging.debug(f"Handling A record for device {device}. IPv4 address: {ip_address}")
+        if 'addresses' not in device:
+            device['addresses'] = []
+        if ip_address not in device['addresses']:
+            device['addresses'].append(ip_address)
+    elif record['type'] == 28:  # AAAA record (IPv6)
+        ip_address = socket.inet_ntop(socket.AF_INET6, record['rdata'])
+        logging.debug(f"Handling AAAA record for device {device}. IPv6 address: {ip_address}")
+        if 'addresses' not in device:
+            device['addresses'] = []
+        if ip_address not in device['addresses']:
+            device['addresses'].append(ip_address)
+    else:
+        logging.warning(f"Unhandled record type: {record['type']}")
+
+async def send_mdns_query_async(interface_ip, service_types, target_ip, timeout):
+    """Sends an mDNS query to a specific IP and listens for responses."""
+    multicast_group_ipv4 = '224.0.0.251'
+    multicast_group_ipv6 = 'ff02::fb'
+    multicast_port = 5353
+    devices = {}
+
+    logging.info(f"Sending mDNS query for {service_types} to {target_ip} on interface {interface_ip}")
+
+    # Clean up the interface_ip string to remove extra text
+    ip_parts = interface_ip.split('(')[0].strip()
+
+    # Create mDNS query packet
+    query = create_mdns_query(service_types)
+
+    # IPv4 transport
+    transport, protocol = await asyncio.get_running_loop().create_datagram_endpoint(
+        MDNSProtocol,
+        family=socket.AF_INET,
+        proto=socket.IPPROTO_UDP,
+        local_addr=('0.0.0.0', 0)  # Bind to an ephemeral port
+    )
+
+    # Join multicast group on the specified interface
+    sock = transport.get_extra_info('socket')
+    if sock is not None:
+        interface_request_ipv4 = socket.inet_aton(ip_parts)
+        multicast_request_ipv4 = socket.inet_aton(multicast_group_ipv4) + interface_request_ipv4
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, multicast_request_ipv4)
+
+        logging.debug(f"IPv4 socket bound and joined multicast group on {interface_ip}")
+
+        # IPv6 transport (only if target is an IPv6 address)
+        if ':' in target_ip:
+            transport_v6, protocol_v6 = await asyncio.get_running_loop().create_datagram_endpoint(
+                MDNSProtocol,
+                family=socket.AF_INET6,
+                proto=socket.IPPROTO_UDP,
+                local_addr=('::', 0)  # Bind to an ephemeral port
+            )
+
+            sock_v6 = transport_v6.get_extra_info('socket')
+            multicast_request_ipv6 = socket.inet_pton(socket.AF_INET6, multicast_group_ipv6)
+            interface_request_ipv6 = socket.inet_pton(socket.AF_INET6, interface_ip)
+            multicast_interface_ipv6 = struct.pack("16s16s", multicast_request_ipv6, interface_request_ipv6)
+
+            sock_v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, multicast_interface_ipv6)
+            logging.debug(f"IPv6 socket bound and joined multicast group on {interface_ip}")
+
+        # Send query and process responses
+        try:
+            # Send to the specific target IP
+            try:
+                transport.sendto(query, (target_ip, multicast_port))
+                logging.debug(f"mDNS query sent via IPv4 to {target_ip}:{multicast_port}")
+            except socket.error as e:
+                logging.debug(f"IPv4 send failed: {e}")
+
+            if ':' in target_ip:
+                try:
+                    transport_v6.sendto(query, (target_ip, multicast_port, 0, 0))
+                    logging.debug(f"mDNS query sent via IPv6 to {target_ip}:{multicast_port}")
+                except socket.error as e:
+                    logging.debug(f"IPv6 send failed: {e}")
+
+            # Receive responses
+            while True:
+                try:
+                    data, addr = await asyncio.wait_for(protocol.received_data.get(), timeout=timeout)
+                    ip = addr[0]
+                    logging.info(f"Received mDNS response from {ip}")
+                    if ip not in devices:
+                        devices[ip] = {'services': []}
+                    records = parse_mdns_response(data)
+                    for record in records:
+                        handle_dns_record(devices[ip], record)
+                except asyncio.TimeoutError:
+                    logging.debug(f"Timeout reached for {target_ip}...")
+                    break
+                except socket.error as e:
+                    logging.debug(f"Error receiving data: {e}")
+                    break
+        except Exception as e:
+            logging.exception(f"Error sending/receiving data from {interface_ip} to {target_ip}: {e}")
+        finally:
+            transport.close()
+            logging.debug("IPv4 socket closed")
+            if ':' in target_ip and 'transport_v6' in locals():
+                transport_v6.close()
+                logging.debug("IPv6 socket closed")
+    else:
+        logging.error("Failed to get socket information from the transport.")
+
+    return devices
+
+def get_active_interface_windows():
+    """Gets the active interface and its IP addresses on Windows using ipconfig."""
+    try:
+        # Use ipconfig to get network interface information
+        ipconfig_output = subprocess.check_output(["ipconfig", "/all"]).decode("utf-8")
+
+        active_interface = None
+        active_ips = []
+        interface_info = {}
+
+        for line in ipconfig_output.splitlines():
+            line = line.strip()
+            if not line:
+                if interface_info:
+                    if interface_info.get("default_gateway"):  # Check if default gateway is present
+                        active_interface = interface_info["name"]
+                        active_ips = interface_info["ip_addresses"]
+                        break  # Assume the first interface with a default gateway is the active one
+                interface_info = {}  # Reset for the next interface
+            else:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+
+                    if "description" in key:
+                        # Handle cases where "..." might not be present in the description.
+                        parts = value.split("...", 1)
+                        interface_info["name"] = parts[-1].strip()  # Get the last part after "..." or the whole string if no "..."
+                    elif "ipv4 address" in key:
+                        if "ip_addresses" not in interface_info:
+                            interface_info["ip_addresses"] = []
+                        interface_info["ip_addresses"].append((value, "IPv4"))
+                    elif "ipv6 address" in key:
+                        if "ip_addresses" not in interface_info:
+                            interface_info["ip_addresses"] = []
+                        interface_info["ip_addresses"].append((value, "IPv6"))
+                    elif "default gateway" in key and value:
+                        interface_info["default_gateway"] = value
+
+        if active_interface and active_ips:
+            logging.info(f"Active interface found: {active_interface}")
+            return [(active_interface, ip, ip_type) for ip, ip_type in active_ips]
+        else:
+            logging.warning("Could not determine the active interface using ipconfig.")
+
+    except Exception as e:
+        logging.exception("Error getting active interface on Windows")
+
+    return []
+
+def get_interfaces_ips():
+    """Gets the IP addresses of the active interface."""
+    interfaces = get_active_interface_windows()
+
+    if interfaces:
+        logging.info(f"Using active interface: {interfaces[0][0]} with IP addresses: {[ip for _, ip, _ in interfaces]}")
+        return interfaces
+    else:
+        logging.error("Could not determine the active interface.")
+        return []
+
+async def scan_cidr_async(interface, interface_ip, service_types, cidr_range, timeout, num_tasks=50):
+    """Scans a given CIDR range for mDNS responses using multiple worker tasks."""
+    all_devices = {}
+    queue = asyncio.Queue()
+
+    # Fill the queue with IP addresses to scan
+    try:
+        for ip in ipaddress.ip_network(cidr_range):
+            await queue.put(str(ip))
+    except ValueError as e:
+        logging.error(f"Invalid CIDR range: {cidr_range} - {e}")
+        return {}
+
+    # Create worker tasks
+    tasks = []
+    for _ in range(num_tasks):
+        task = asyncio.create_task(worker(queue, interface, interface_ip, service_types, timeout, all_devices))
+        tasks.append(task)
+
+    await queue.join()  # Wait for all items in the queue to be processed
+
+    for task in tasks:
+        task.cancel()  # Cancel the worker tasks
+    await asyncio.gather(*tasks, return_exceptions=True)  # Ensure cleanup
+
+    return all_devices
+
+async def worker(queue, interface, interface_ip, service_types, timeout, all_devices):
+    """Worker task to process IP addresses from the queue and scan them."""
+    while True:
+        try:
+            target_ip = await queue.get()
+            logging.info(f"Scanning IP: {target_ip}")
+            try:
+                discovered_devices = await asyncio.wait_for(
+                    send_mdns_query_async(interface_ip, service_types, target_ip, timeout),
+                    timeout=timeout + 1  # Add a little extra time for task overhead
+                )
+                if discovered_devices:
+                    for ip_addr, info in discovered_devices.items():
+                        if ip_addr not in all_devices:
+                            all_devices[ip_addr] = info
+                        else:
+                            all_devices[ip_addr].update(info)
+            except asyncio.TimeoutError:
+                logging.debug(f"Timeout scanning IP: {target_ip}")
+            finally:
+                queue.task_done()
+        except asyncio.CancelledError:
+            break
+
+async def main():
+    # Define a list of common service types to check
+    common_service_types = [
+        "_http._tcp.local",
+        "_https._tcp.local",
+        "_ssh._tcp.local",
+        "_smb._tcp.local",  # Samba/CIFS file sharing
+        "_afpovertcp._tcp.local",  # Apple Filing Protocol
+        "_ipp._tcp.local",  # Internet Printing Protocol
+        "_ipps._tcp.local", # Internet Printing Protocol over https
+        "_printer._tcp.local",  # General printer service
+        "_airplay._tcp.local",  # Apple AirPlay
+        "_raop._tcp.local",  # Remote Audio Output Protocol (AirTunes)
+        "_googlecast._tcp.local",  # Google Chromecast
+        "_spotify-connect._tcp.local", #Spotify
+        "_device-info._udp.local", #Device info
+        "_services._dns-sd._udp.local" # A list of services on the network
+    ]
+
+    interfaces = get_interfaces_ips()
+
+    if not interfaces:
+        logging.critical("No available network interfaces found. Exiting.")
+        sys.exit(1)
+
+    print("Available network interfaces:")
+    for i, (interface, ip, ip_type) in enumerate(interfaces):
+        print(f"{i + 1}. {interface} ({ip}) [{ip_type}]")
+
+    while True:
+        try:
+            selected_interfaces_input = input("Select interface(s) to scan (comma-separated numbers, or 'all' for all): ")
+            if selected_interfaces_input.lower() == 'all':
+                selected_interfaces = interfaces
+                break
+            else:
+                selected_indices = [int(x.strip()) - 1 for x in selected_interfaces_input.split(',')]
+                selected_interfaces = [interfaces[i] for i in selected_indices if 0 <= i < len(interfaces)]
+                if not selected_interfaces:
+                    logging.warning("No valid interfaces selected.")
+                    raise ValueError("No valid interfaces selected.")
+                break
+        except (ValueError, IndexError):
+            logging.error("Invalid input. Please enter valid interface numbers or 'all'.")
+
+    timeout = int(input("Enter the timeout in seconds (default 5): ") or 5)
+
+    cidr_range = input("Enter the CIDR range to scan (e.g., 192.168.1.0/24): ")
+
+    all_devices = {}
+    for interface, interface_ip, _ in selected_interfaces:
+        print(f"\nScanning CIDR range {cidr_range} from interface: {interface} ({interface_ip})")
+        discovered_devices = await scan_cidr_async(interface, interface_ip, common_service_types, cidr_range, timeout)
+        if discovered_devices:
+            for ip, info in discovered_devices.items():
+                if ip not in all_devices:
+                    all_devices[ip] = info
+                else:
+                    all_devices[ip].update(info)
+                    logging.debug("IPv6 socket closed")
+    else:
+        logging.error("Failed to get socket information from the transport.")
+
+    return devices
+
+def get_active_interface_windows():
+    """Gets the active interface and its IP addresses on Windows using ipconfig."""
+    try:
+        # Use ipconfig to get network interface information
+        ipconfig_output = subprocess.check_output(["ipconfig", "/all"]).decode("utf-8")
+
+        active_interface = None
+        active_ips = []
+        interface_info = {}
+
+        for line in ipconfig_output.splitlines():
+            line = line.strip()
+            if not line:
+                if interface_info:
+                    if interface_info.get("default_gateway"):  # Check if default gateway is present
+                        active_interface = interface_info["name"]
+                        active_ips = interface_info["ip_addresses"]
+                        break  # Assume the first interface with a default gateway is the active one
+                interface_info = {}  # Reset for the next interface
+            else:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+
+                    if "description" in key:
+                        # Handle cases where "..." might not be present in the description.
+                        parts = value.split("...", 1)
+                        interface_info["name"] = parts[-1].strip()  # Get the last part after "..." or the whole string if no "..."
+                    elif "ipv4 address" in key:
+                        if "ip_addresses" not in interface_info:
+                            interface_info["ip_addresses"] = []
+                        interface_info["ip_addresses"].append((value, "IPv4"))
+                    elif "ipv6 address" in key:
+                        if "ip_addresses" not in interface_info:
+                            interface_info["ip_addresses"] = []
+                        interface_info["ip_addresses"].append((value, "IPv6"))
+                    elif "default gateway" in key and value:
+                        interface_info["default_gateway"] = value
+
+        if active_interface and active_ips:
+            logging.info(f"Active interface found: {active_interface}")
+            return [(active_interface, ip, ip_type) for ip, ip_type in active_ips]
+        else:
+            logging.warning("Could not determine the active interface using ipconfig.")
+
+    except Exception as e:
+        logging.exception("Error getting active interface on Windows")
+
+    return []
+
+def get_interfaces_ips():
+    """Gets the IP addresses of the active interface."""
+    interfaces = get_active_interface_windows()
+
+    if interfaces:
+        logging.info(f"Using active interface: {interfaces[0][0]} with IP addresses: {[ip for _, ip, _ in interfaces]}")
+        return interfaces
+    else:
+        logging.error("Could not determine the active interface.")
+        return []
+
+async def scan_cidr_async(interface, interface_ip, service_types, cidr_range, timeout, num_tasks=50):
+    """Scans a given CIDR range for mDNS responses using multiple worker tasks."""
+    all_devices = {}
+    queue = asyncio.Queue()
+
+    # Fill the queue with IP addresses to scan
+    try:
+        for ip in ipaddress.ip_network(cidr_range):
+            await queue.put(str(ip))
+    except ValueError as e:
+        logging.error(f"Invalid CIDR range: {cidr_range} - {e}")
+        return {}
+
+    # Create worker tasks
+    tasks = []
+    for _ in range(num_tasks):
+        task = asyncio.create_task(worker(queue, interface, interface_ip, service_types, timeout, all_devices))
+        tasks.append(task)
+
+    await queue.join()  # Wait for all items in the queue to be processed
+
+    for task in tasks:
+        task.cancel()  # Cancel the worker tasks
+    await asyncio.gather(*tasks, return_exceptions=True)  # Ensure cleanup
+
+    return all_devices
+
+async def worker(queue, interface, interface_ip, service_types, timeout, all_devices):
+    """Worker task to process IP addresses from the queue and scan them."""
+    while True:
+        try:
+            target_ip = await queue.get()
+            logging.info(f"Scanning IP: {target_ip}")
+            try:
+                discovered_devices = await asyncio.wait_for(
+                    send_mdns_query_async(interface_ip, service_types, target_ip, timeout),
+                    timeout=timeout + 1  # Add a little extra time for task overhead
+                )
+                if discovered_devices:
+                    for ip_addr, info in discovered_devices.items():
+                        if ip_addr not in all_devices:
+                            all_devices[ip_addr] = info
+                        else:
+                            all_devices[ip_addr].update(info)
+            except asyncio.TimeoutError:
+                logging.debug(f"Timeout scanning IP: {target_ip}")
+            finally:
+                queue.task_done()
+        except asyncio.CancelledError:
+            break
+
+async def main():
+    # Define a list of common service types to check
+    common_service_types = [
+        "_http._tcp.local",
+        "_https._tcp.local",
+        "_ssh._tcp.local",
+        "_smb._tcp.local",  # Samba/CIFS file sharing
+        "_afpovertcp._tcp.local",  # Apple Filing Protocol
+        "_ipp._tcp.local",  # Internet Printing Protocol
+        "_ipps._tcp.local", # Internet Printing Protocol over https
+        "_printer._tcp.local",  # General printer service
+        "_airplay._tcp.local",  # Apple AirPlay
+        "_raop._tcp.local",  # Remote Audio Output Protocol (AirTunes)
+        "_googlecast._tcp.local",  # Google Chromecast
+        "_spotify-connect._tcp.local", #Spotify
+        "_device-info._udp.local", #Device info
+        "_services._dns-sd._udp.local" # A list of services on the network
+    ]
+
+    interfaces = get_interfaces_ips()
+
+    if not interfaces:
+        logging.critical("No available network interfaces found. Exiting.")
+        sys.exit(1)
+
+    print("Available network interfaces:")
+    for i, (interface, ip, ip_type) in enumerate(interfaces):
+        print(f"{i + 1}. {interface} ({ip}) [{ip_type}]")
+
+    while True:
+        try:
+            selected_interfaces_input = input("Select interface(s) to scan (comma-separated numbers, or 'all' for all): ")
+            if selected_interfaces_input.lower() == 'all':
+                selected_interfaces = interfaces
+                break
+            else:
+                selected_indices = [int(x.strip()) - 1 for x in selected_interfaces_input.split(',')]
+                selected_interfaces = [interfaces[i] for i in selected_indices if 0 <= i < len(interfaces)]
+                if not selected_interfaces:
+                    logging.warning("No valid interfaces selected.")
+                    raise ValueError("No valid interfaces selected.")
+                break
+        except (ValueError, IndexError):
+            logging.error("Invalid input. Please enter valid interface numbers or 'all'.")
+
+    timeout = int(input("Enter the timeout in seconds (default 5): ") or 5)
+
+    cidr_range = input("Enter the CIDR range to scan (e.g., 192.168.1.0/24): ")
+
+    all_devices = {}
+    for interface, interface_ip, _ in selected_interfaces:
+        print(f"\nScanning CIDR range {cidr_range} from interface: {interface} ({interface_ip})")
+        discovered_devices = await scan_cidr_async(interface, interface_ip, common_service_types, cidr_range, timeout)
+        if discovered_devices:
+            for ip, info in discovered_devices.items():
+                if ip not in all_devices:
+                    all_devices[ip] = info
+                else:
+                    all_devices[ip].update(info)
+
+    # Print the results
+    print("\nDiscovered devices:")
+    for ip, info in all_devices.items():
+        print(f"\nIP: {ip}")
+        if 'services' in info:
+            print("Services:")
+            for service in info['services']:
+                print(f"  - {service}")
+        if 'addresses' in info:
+            print("Addresses:")
+            for address in info['addresses']:
+                print(f"  - {address}")
+        if 'srv_records' in info:
+            print("SRV Records:")
+            for srv in info['srv_records']:
+                print(f"  - Priority: {srv['priority']}, Weight: {srv['weight']}, Port: {srv['port']}, Target: {srv['target']}")
+        if 'txt_records' in info:
+            print("TXT Records:")
+            for txt in info['txt_records']:
+                for key, value in txt.items():
+                    print(f"  - {key}: {value}")
+
+    # Save results to a JSON file
+    output_file = "mdns_scan_results.json"
+    with open(output_file, 'w') as f:
+        json.dump(all_devices, f, indent=2)
+    print(f"\nResults saved to {output_file}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
