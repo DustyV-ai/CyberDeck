@@ -1,0 +1,280 @@
+import asyncio
+import ipaddress
+import socket
+import platform
+import sys
+import logging
+from typing import Tuple, List, Optional
+import subprocess
+import struct
+import os
+import ctypes
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def is_windows() -> bool:
+    """Check if the operating system is Windows."""
+    return platform.system().lower() == "windows"
+
+def check_privileges() -> bool:
+    """Check if the script has necessary privileges for ICMP."""
+    if is_windows():
+        try:
+            return os.environ.get('USERNAME') == 'SYSTEM' or bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except:
+            return False
+    else:
+        return os.geteuid() == 0
+
+async def ping_host_v4(ip: str, timeout: int = 1) -> bool:
+    """Ping an IPv4 host using the appropriate system command."""
+    if is_windows():
+        command = ["ping", "-n", "1", "-w", str(timeout * 1000), str(ip)]
+    else:
+        command = ["ping", "-c", "1", "-W", str(timeout), str(ip)]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        output = stdout.decode()
+        
+        return ("Reply from" in output) if is_windows() else ("1 received" in output)
+    except:
+        return False
+
+async def ping_host_v6(ip: str, timeout: int = 1) -> bool:
+    """Ping an IPv6 host using the appropriate system command."""
+    if is_windows():
+        command = ["ping", "-6", "-n", "1", "-w", str(timeout * 1000), str(ip)]
+    else:
+        command = ["ping6", "-c", "1", "-W", str(timeout), str(ip)]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        output = stdout.decode()
+        
+        return ("Reply from" in output) if is_windows() else ("1 received" in output)
+    except:
+        return False
+
+async def send_ndp_multicast(interface_index: int) -> List[str]:
+    """
+    Sends an NDP Router Solicitation multicast and listens for replies.
+
+    Args:
+        interface_index: The network interface index to use.
+
+    Returns:
+        A list of IPv6 addresses discovered.
+    """
+    discovered_hosts = []
+    try:
+        # Create a raw socket for IPv6 ICMP
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
+        sock.bind(("", 0))
+
+        # Construct the NDP Router Solicitation message
+        # Type: 133 (Router Solicitation)
+        # Code: 0
+        # Checksum: 0 (to be calculated)
+        # Reserved: 0
+        # Source link-layer address option (if known)
+        icmp_msg = struct.pack("!BBH4s", 133, 0, 0, b'\x00' * 4)
+
+        # Calculate the checksum
+        checksum = 0
+        for i in range(0, len(icmp_msg), 2):
+            checksum += (icmp_msg[i] << 8) + icmp_msg[i+1]
+        checksum = (checksum >> 16) + (checksum & 0xffff)
+        checksum = ~checksum & 0xffff
+        icmp_msg = struct.pack("!BBH4s", 133, 0, checksum, b'\x00' * 4)
+
+        # Send the multicast packet
+        sock.sendto(icmp_msg, ("ff02::2", 0, interface_index)) # ff02::2 is all-routers
+        logging.debug(f"NDP Router Solicitation sent on interface {interface_index}")
+
+        # Listen for replies (Router Advertisements) with a timeout
+        sock.settimeout(2)
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+                if data[0] == 134:  # 134 is Router Advertisement
+                    discovered_hosts.append(addr[0])
+                    logging.debug(f"Received Router Advertisement from {addr[0]}")
+            except socket.timeout:
+                break
+            except Exception as e:
+                logging.error(f"Error receiving NDP reply: {e}")
+                break
+
+        sock.close()
+
+    except Exception as e:
+        logging.error(f"Error in NDP multicast discovery: {e}")
+
+    return discovered_hosts
+
+async def scan_network(subnet: str, scan_v6: bool = True) -> Tuple[List[str], List[str]]:
+    """
+    Scan a network for both IPv4 and IPv6 hosts.
+    
+    Args:
+        subnet: IPv4 subnet in CIDR notation (e.g., "192.168.1.0/24")
+        scan_v6: Whether to also scan for IPv6 addresses
+    
+    Returns:
+        Tuple of (active_v4_hosts, active_v6_hosts)
+    """
+    active_v4_hosts = []
+    active_v6_hosts = []
+    v4_tasks = []
+    v6_tasks = []
+
+    # Scan IPv4 subnet
+    try:
+        network = ipaddress.ip_network(subnet, strict=False)
+        for ip in network.hosts():
+            v4_tasks.append(ping_host_v4(str(ip)))
+        
+        v4_results = await asyncio.gather(*v4_tasks)
+        active_v4_hosts = [str(ip) for ip, is_active in zip(network.hosts(), v4_results) if is_active]
+    except Exception as e:
+        logging.error(f"Error scanning IPv4 network: {e}")
+
+    # Scan for IPv6 using NDP multicast if requested
+    if scan_v6:
+        try:
+            if is_windows():
+                interfaces = socket.if_nameindex()
+                # Assuming we use the first non-loopback interface for simplicity. 
+                # You might need a better way to choose the correct interface.
+                for interface in interfaces:
+                    if not "Loopback" in interface[1]:
+                        interface_index = interface[0]
+                        break
+            else:
+                interface_index = socket.if_nametoindex("eth0")  # Replace "eth0" with your interface name
+            ndp_results = await send_ndp_multicast(interface_index)
+            active_v6_hosts.extend(ndp_results)
+        except Exception as e:
+            logging.error(f"Error during NDP multicast scan: {e}")
+        
+        # Ping found ipv6 to make sure they are active
+        ping_tasks = [ping_host_v6(host) for host in active_v6_hosts]
+        ping_results = await asyncio.gather(*ping_tasks)
+        active_v6_hosts = [host for host, is_active in zip(active_v6_hosts, ping_results) if is_active]
+
+        # Remove duplicates if any
+        active_v6_hosts = list(set(active_v6_hosts))
+
+    return active_v4_hosts, active_v6_hosts
+
+def get_local_subnets() -> Tuple[Optional[str], Optional[str]]:
+    """Get both IPv4 and IPv6 local subnets."""
+    v4_subnet = None
+    v6_subnet = None
+
+    try:
+        # Get all network interfaces
+        if is_windows():
+            hostname = socket.gethostname()
+            addrs = socket.getaddrinfo(hostname, None)
+        else:
+            # On Unix-like systems, try to get all addresses
+            addrs = socket.getaddrinfo(None, None)
+
+        for addr in addrs:
+            ip = addr[4][0]
+            try:
+                if type(ipaddress.ip_address(ip)) is ipaddress.IPv4Address:
+                    if not ip.startswith('127.'):  # Skip loopback
+                        v4_subnet = f"{ip.rsplit('.', 1)[0]}.0/24"
+                elif type(ipaddress.ip_address(ip)) is ipaddress.IPv6Address:
+                    if not ip.startswith('fe80:'):  # Skip link-local
+                        v6_subnet = f"{ip.rsplit(':', 1)[0]}::/64"
+            except:
+                continue
+
+    except Exception as e:
+        logging.error(f"Error detecting local subnets: {e}")
+
+    return v4_subnet, v6_subnet
+
+async def main_async():
+    """Main function to run the network scanner."""
+    if not check_privileges():
+        logging.warning("This script may require administrative/root privileges for ICMP operations")
+        
+    v4_subnet, v6_subnet = get_local_subnets()
+    
+    while True:
+        user_input = input(
+            f"Enter the IPv4 network subnet to scan (CIDR format, e.g., 192.168.1.0/24)\n"
+            f"Or type 'auto' to use detected subnet: {v4_subnet}\n"
+            f"Subnet: "
+        )
+        
+        try:
+            if user_input.lower() == 'auto' and v4_subnet:
+                subnet_to_scan = v4_subnet
+            else:
+                subnet_to_scan = user_input
+                # Validate the subnet
+                ipaddress.ip_network(subnet_to_scan, strict=False)
+            break
+        except ValueError:
+            logging.error("Invalid subnet format. Please try again.")
+
+    logging.info(f"Starting network scan on subnet: {subnet_to_scan}")
+    
+    try:
+        v4_hosts, v6_hosts = await scan_network(subnet_to_scan)
+        
+        if not v4_hosts and not v6_hosts:
+            logging.info("No active hosts found on the network.")
+            return
+
+        print("\nScan Results:")
+        print("-" * 50)
+        
+        if v4_hosts:
+            print("\nActive IPv4 Hosts:")
+            for host in v4_hosts:
+                print(f"  • {host}")
+        
+        if v6_hosts:
+            print("\nActive IPv6 Hosts:")
+            for host in v6_hosts:
+                print(f"  • {host}")
+        else:
+            print("\nNo active IPv6 hosts found")
+
+        print("\nSummary:")
+        print(f"Total IPv4 hosts: {len(v4_hosts)}")
+        print(f"Total IPv6 hosts: {len(v6_hosts)}")
+        print(f"IPv6 adoption rate: {(len(v6_hosts) / len(v4_hosts) * 100 if v4_hosts else 0):.1f}%")
+
+    except Exception as e:
+        logging.error(f"An error occurred during scanning: {e}")
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 7):
+        logging.error("This script requires Python 3.7 or higher")
+        sys.exit(1)
+
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logging.info("\nScan interrupted by user")
+    except Exception as e:
+        logging.error(f"An unhandled error occurred: {e}")
