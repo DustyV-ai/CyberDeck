@@ -1,0 +1,273 @@
+# Connect to Microsoft Graph (Requires appropriate permissions)
+Connect-MgGraph -Scopes "Directory.Read.All", "User.Read.All", "Policy.Read.All", "Application.Read.All", "AuditLog.Read.All", "UserAuthenticationMethod.Read.All"
+
+# --- Data Structures ---
+$script:usersWithoutMFAEnforced = @()
+$script:usersExcludedFromPolicy = @()
+$script:usersWithoutMFAMethods = @()
+$script:userMFAStatus = @{}
+
+# Cache for role and group memberships
+$script:roleMembershipCache = @{}
+$script:groupMembershipCache = @{}
+
+# Custom object to store detailed MFA status
+class UserMFADetail {
+    [string]$DisplayName
+    [string]$UserPrincipalName
+    [System.Collections.ArrayList]$ApplicablePolicies
+    [bool]$IsExcluded
+    [bool]$HasMFAMethods
+    [bool]$PerUserMFAEnabled
+    [string]$Status
+    
+    UserMFADetail([string]$displayName, [string]$upn) {
+        $this.DisplayName = $displayName
+        $this.UserPrincipalName = $upn
+        $this.ApplicablePolicies = [System.Collections.ArrayList]::new()
+        $this.IsExcluded = $false
+        $this.HasMFAMethods = $false
+        $this.PerUserMFAEnabled = $false
+        $this.Status = "Unknown"
+    }
+}
+
+# --- Functions ---
+function Get-CachedDirectoryRoleMembers {
+    param (
+        [string]$RoleId
+    )
+    
+    if (-not $script:roleMembershipCache.ContainsKey($RoleId)) {
+        try {
+            $role = Get-MgDirectoryRole -Filter "roleTemplateId eq '$RoleId'" -ErrorAction Stop
+            if ($role) {
+                $members = Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All
+                $script:roleMembershipCache[$RoleId] = $members.Id
+            }
+            else {
+                Write-Warning "Role not found: $RoleId"
+                $script:roleMembershipCache[$RoleId] = @()
+            }
+        }
+        catch {
+            Write-Warning "Error getting role members for $RoleId : $($_.Exception.Message)"
+            $script:roleMembershipCache[$RoleId] = @()
+        }
+    }
+    return $script:roleMembershipCache[$RoleId]
+}
+
+function Get-CachedGroupMembers {
+    param (
+        [string]$GroupId
+    )
+    
+    if (-not $script:groupMembershipCache.ContainsKey($GroupId)) {
+        try {
+            $members = Get-MgGroupMember -GroupId $GroupId -All
+            $script:groupMembershipCache[$GroupId] = $members.Id
+        }
+        catch {
+            Write-Warning "Error getting group members for $GroupId : $($_.Exception.Message)"
+            $script:groupMembershipCache[$GroupId] = @()
+        }
+    }
+    return $script:groupMembershipCache[$GroupId]
+}
+
+function Test-UserHasMFAMethods {
+    param (
+        [string]$UserId
+    )
+    try {
+        $methods = Get-MgUserAuthenticationMethod -UserId $UserId -ErrorAction Stop
+        return $methods.Count -gt 0
+    }
+    catch {
+        Write-Warning "Error checking MFA methods for user ${UserId}: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-UserPerUserMFAStatus {
+    param (
+        [string]$UserId
+    )
+    try {
+        # Get user's authentication methods
+        $authMethods = Get-MgUserAuthenticationMethod -UserId $UserId -ErrorAction Stop
+        
+        # Check if user has per-user MFA enabled
+        $strongAuthDetails = Get-MgUser -UserId $UserId -Property StrongAuthenticationRequirements
+        
+        $isEnabled = $false
+        $isEnforced = $false
+        
+        if ($strongAuthDetails.StrongAuthenticationRequirements.Count -gt 0) {
+            $isEnabled = $true
+            $state = $strongAuthDetails.StrongAuthenticationRequirements[0].State
+            $isEnforced = ($state -eq "Enforced")
+        }
+        
+        return @{
+            Enabled = $isEnabled
+            Enforced = $isEnforced
+        }
+    }
+    catch {
+        Write-Warning "Error checking per-user MFA status for user ${UserId}: $($_.Exception.Message)"
+        return @{
+            Enabled = $false
+            Enforced = $false
+        }
+    }
+}
+
+# --- Main Script ---
+Write-Host "Starting MFA policy analysis..." -ForegroundColor Green
+
+# Get all Conditional Access policies
+try {
+    $allCAPolicies = Get-MgIdentityConditionalAccessPolicy -ErrorAction Stop
+    $relevantCAPolicies = $allCAPolicies | Where-Object {
+        $_.State -eq "Enabled" -and ($_.GrantControls.BuiltInControls -contains "Mfa" -or $_.GrantControls.CustomAuthenticationFactors -ne $null)
+    }
+}
+catch {
+    Write-Error "Failed to retrieve Conditional Access policies: $($_.Exception.Message)"
+    exit
+}
+
+if ($relevantCAPolicies.Count -eq 0) {
+    Write-Warning "No Conditional Access policies found that might enforce MFA."
+    exit
+}
+
+Write-Host "Found $($relevantCAPolicies.Count) potentially relevant Conditional Access policies:"
+
+# Get all users upfront
+try {
+    Write-Host "Retrieving all users..."
+    $allUsers = Get-MgUser -Filter "UserType eq 'Member'" -ConsistencyLevel eventual -All
+    Write-Host "Found $($allUsers.Count) users to process"
+}
+catch {
+    Write-Error "Failed to retrieve users: $($_.Exception.Message)"
+    exit
+}
+
+# Initialize MFA status tracking for each user
+$allUsers | ForEach-Object {
+    $script:userMFAStatus[$_.Id] = [UserMFADetail]::new($_.DisplayName, $_.UserPrincipalName)
+}
+
+# Process each policy
+foreach ($policy in $relevantCAPolicies) {
+    Write-Host "`n----------------------------------------"
+    Write-Host "Analyzing Policy: $($policy.DisplayName)" -ForegroundColor Cyan
+    Write-Host "----------------------------------------"
+    Write-Host "  State: $($policy.State)"
+    
+    $userCount = 0
+    $totalUsers = $allUsers.Count
+
+    foreach ($user in $allUsers) {
+        $userCount++
+        if ($userCount % 10 -eq 0) {
+            Write-Host "  Progress: $userCount / $totalUsers users processed`r" -NoNewline
+        }
+
+        $userDetail = $script:userMFAStatus[$user.Id]
+        
+        # Check exclusions
+        $excluded = $false
+        if ($policy.Conditions.Users.ExcludeUsers -contains $user.Id) {
+            $excluded = $true
+        }
+        else {
+            # Check excluded groups
+            foreach ($groupId in $policy.Conditions.Users.ExcludeGroups) {
+                if ((Get-CachedGroupMembers -GroupId $groupId) -contains $user.Id) {
+                    $excluded = $true
+                    break
+                }
+            }
+
+            # Check excluded roles
+            if (-not $excluded) {
+                foreach ($roleId in $policy.Conditions.Users.ExcludeRoles) {
+                    if ((Get-CachedDirectoryRoleMembers -RoleId $roleId) -contains $user.Id) {
+                        $excluded = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        if (-not $excluded) {
+            $userDetail.ApplicablePolicies.Add($policy.DisplayName) | Out-Null
+        }
+
+        # Check MFA methods (only need to do this once per user)
+        if (-not $userDetail.HasMFAMethods) {
+            $userDetail.HasMFAMethods = Test-UserHasMFAMethods -UserId $user.Id
+        }
+
+        # Check per-user MFA status (only need to do this once per user)
+        if (-not $userDetail.PerUserMFAEnabled) {
+            $perUserMFAStatus = Get-UserPerUserMFAStatus -UserId $user.Id
+            $userDetail.PerUserMFAEnabled = $perUserMFAStatus.Enabled
+        }
+
+        # Determine overall status
+        if ($userDetail.HasMFAMethods -and $userDetail.PerUserMFAEnabled) {
+            $userDetail.Status = "MFA Enforced"
+        }
+        elseif ($userDetail.HasMFAMethods) {
+            $userDetail.Status = "MFA Methods Available but not Enforced"
+        }
+        else {
+            $userDetail.Status = "No MFA Methods Registered"
+        }
+    }
+    Write-Host "`nCompleted processing users for this policy"
+}
+
+# Export detailed results with all applicable policies
+$detailedResults = $script:userMFAStatus.Values | Select-Object `
+    DisplayName, `
+    UserPrincipalName, `
+    @{N='Applicable Policies';E={$_.ApplicablePolicies -join "; "}}, `
+    @{N='Has MFA Methods';E={$_.HasMFAMethods}}, `
+    @{N='Per-User MFA Enabled';E={$_.PerUserMFAEnabled}}, `
+    Status
+
+$detailedResults | Export-Csv -Path "DetailedMFAStatus.csv" -NoTypeInformation
+
+# Output Summary
+Write-Host "`n----------------------------------------"
+Write-Host "MFA Status Summary" -ForegroundColor Green
+Write-Host "----------------------------------------"
+
+$summary = $detailedResults | Group-Object Status | Select-Object Name, Count
+$summary | ForEach-Object {
+    Write-Host "$($_.Name): $($_.Count) users"
+}
+
+Write-Host "`nPolicy Coverage Summary:"
+$policyStats = $detailedResults | 
+    Select-Object @{N='Policies';E={$_.'Applicable Policies'.Split(';') | ForEach-Object { $_.Trim() }}} |
+    Select-Object -ExpandProperty Policies |
+    Group-Object |
+    Select-Object Name, Count
+
+$policyStats | ForEach-Object {
+    Write-Host "$($_.Name): $($_.Count) users"
+}
+
+Write-Host "`nDetailed results exported to DetailedMFAStatus.csv"
+
+# Cleanup
+Disconnect-MgGraph
+Write-Host "`nScript execution completed" -ForegroundColor Green
