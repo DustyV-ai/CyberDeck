@@ -27,6 +27,9 @@ Import-Module Microsoft.Graph.Authentication
 Import-Module Microsoft.Graph.Identity.SignIns
 Import-Module Microsoft.Graph.Users
 
+# Add System.Web assembly for password generation
+Add-Type -AssemblyName System.Web
+
 # Configuration
 $script:LogFile = "ComplianceSearchLog.txt"
 $script:SearchQueryTemplate = "from:{0}"
