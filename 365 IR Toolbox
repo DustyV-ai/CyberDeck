@@ -79,7 +79,10 @@ function Start-ComplianceSearch {
     param(
         [Parameter(Mandatory=$true)]
         [ValidatePattern("^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$")]
-        [string]$EmailAddress
+        [string]$EmailAddress,
+        
+        [Parameter(Mandatory=$false)]
+        [int]$TimeoutMinutes = 30
     )
 
     $baseSearchName = "Search_$($EmailAddress.Replace('@','_'))"
@@ -91,7 +94,14 @@ function Start-ComplianceSearch {
     if ([string]::IsNullOrWhiteSpace($emailSubject)) {
         $searchQuery = $script:SearchQueryTemplate -f $EmailAddress
     } else {
-        $searchQuery = "($($script:SearchQueryTemplate -f $EmailAddress)) AND (Subject:'$emailSubject')"
+        $searchQuery = "($($script:SearchQueryTemplate -f $EmailAddress)) AND (Subject:`"$emailSubject`")"
+    }
+
+    # Confirm before proceeding
+    $confirmSearch = Read-Host "Ready to search for emails from $EmailAddress $(if(-not [string]::IsNullOrWhiteSpace($emailSubject)){"with subject containing '$emailSubject'"})? (Y/N)"
+    if ($confirmSearch -ne "Y") {
+        Write-Log "Search cancelled by user." -Level Info
+        return
     }
 
     try {
@@ -99,24 +109,52 @@ function Start-ComplianceSearch {
             throw "Unable to establish connection to Security & Compliance Center."
         }
 
-        $searchName = New-UniqueSearchName -BaseName $baseSearchName
+        # Create a unique search name
+        $searchName = $null
+        $counter = 0
+        do {
+            $searchName = if ($counter -eq 0) { $baseSearchName } else { "${baseSearchName}_$counter" }
+            $counter++
+            
+            $existingSearch = Get-ComplianceSearch -Identity $searchName -ErrorAction SilentlyContinue
+        } while ($existingSearch -ne $null)
+
         Write-Log "Creating compliance search: $searchName" -Level Info
 
+        # Attempt to create the search with proper parameters
         $retryCount = 0
+        $maxRetries = $script:MaxRetries
+        $success = $false
+        
         do {
             try {
-                $search = New-ComplianceSearch -Name $searchName -ExchangeLocation All -ContentMatchQuery $searchQuery -ErrorAction Stop
+                # Note the correct parameters: using quotes around "All" and proper parameter syntax
+                $search = New-ComplianceSearch -Name $searchName -AllMailboxes $true -ContentMatchQuery $searchQuery -ErrorAction Stop
+                $success = $true
+                Write-Log "Successfully created compliance search" -Level Info
                 break
             }
             catch {
                 $retryCount++
-                if ($retryCount -ge $script:MaxRetries) {
+                # Check for specific errors
+                if ($_.ToString() -like "*already exists*") {
+                    Write-Log "Search name already exists. Trying with a different name..." -Level Warning
+                    $searchName = "${baseSearchName}_$(Get-Random -Minimum 1000 -Maximum 9999)"
+                    continue
+                }
+                
+                if ($retryCount -ge $maxRetries) {
                     throw
                 }
-                Write-Log "Attempt $retryCount failed. Retrying in $script:RetryDelay seconds..." -Level Warning
+                
+                Write-Log "Attempt $retryCount failed: $_. Retrying in $script:RetryDelay seconds..." -Level Warning
                 Start-Sleep -Seconds $script:RetryDelay
             }
         } while ($true)
+
+        if (-not $success) {
+            throw "Failed to create compliance search after $maxRetries attempts."
+        }
 
         Write-Log "Starting compliance search: $searchName" -Level Info
         Start-ComplianceSearch -Identity $searchName -ErrorAction Stop
@@ -127,11 +165,33 @@ function Start-ComplianceSearch {
             Status = "Searching..."
             PercentComplete = 0
         }
+        
+        $startTime = Get-Date
+        $timeoutTime = $startTime.AddMinutes($TimeoutMinutes)
+        
         do {
             Start-Sleep -Seconds 5
             $searchStatus = Get-ComplianceSearch -Identity $searchName -ErrorAction Stop
-            $progressParams.PercentComplete = [math]::Min($searchStatus.PercentComplete, 100)
+            
+            # Handle null percentage during initial search phases
+            $percentComplete = 0
+            if ($null -ne $searchStatus.PercentComplete) {
+                $percentComplete = [math]::Min($searchStatus.PercentComplete, 100)
+            }
+            
+            $progressParams.PercentComplete = $percentComplete
+            $progressParams.Status = "Searching... $percentComplete% complete"
+            
             Write-Progress @progressParams
+            
+            # Check for timeout
+            if ((Get-Date) -gt $timeoutTime) {
+                Write-Log "Search timed out after $TimeoutMinutes minutes." -Level Warning
+                Write-Host "The search is still running but this command has timed out. You can check the status later with:" -ForegroundColor Yellow
+                Write-Host "Get-ComplianceSearch -Identity `"$searchName`"" -ForegroundColor Cyan
+                return
+            }
+            
         } while ($searchStatus.Status -ne "Completed")
 
         Write-Progress -Activity "Compliance Search" -Completed
@@ -139,14 +199,50 @@ function Start-ComplianceSearch {
         $results = Get-ComplianceSearch -Identity $searchName -ErrorAction Stop
         if ($results) {
             Write-Log "Search completed. Found $($results.Items) items." -Level Info
-
-            $purgeConfirm = Read-Host "Do you want to purge these items? (Y/N)"
-            if ($purgeConfirm -eq "Y") {
-                $purgeAction = New-ComplianceSearchAction -SearchName $searchName -Purge -PurgeType HardDelete -Confirm:$false -ErrorAction Stop
-                if ($purgeAction) {
-                    Write-Log "Purge action initiated." -Level Info
+            
+            if ($results.Items -gt 0) {
+                # Display more details about the results
+                Write-Host "Search Results Summary:" -ForegroundColor Green
+                Write-Host "-------------------------" -ForegroundColor Green
+                Write-Host "Search Name: $($results.Name)" -ForegroundColor Green
+                Write-Host "Query: $($results.ContentMatchQuery)" -ForegroundColor Green
+                Write-Host "Items Found: $($results.Items)" -ForegroundColor Green
+                Write-Host "Size: $($results.Size)" -ForegroundColor Green
+                Write-Host "Status: $($results.Status)" -ForegroundColor Green
+                Write-Host "Locations: $($results.SearchStatistics)" -ForegroundColor Green
+                
+                # Offer to export detailed results
+                $exportChoice = Read-Host "Do you want to export detailed results to a CSV file? (Y/N)"
+                if ($exportChoice -eq "Y") {
+                    $exportPath = Join-Path -Path $env:USERPROFILE -ChildPath "Desktop\ComplianceSearchResults_$searchName.csv"
+                    
+                    # Use the Search-ComplianceSearch cmdlet to get detailed results
+                    # Note: This cmdlet might not be available in all environments
+                    try {
+                        $detailedResults = New-ComplianceSearchAction -SearchName $searchName -Preview -ErrorAction Stop
+                        Start-Sleep -Seconds 5
+                        $previewResults = Get-ComplianceSearchAction -Identity "$searchName`_Preview" -ErrorAction Stop
+                        $previewResults | Export-Csv -Path $exportPath -NoTypeInformation
+                        Write-Host "Results exported to: $exportPath" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Log "Failed to export detailed results: $_" -Level Error
+                        Write-Host "Unable to export detailed results. You can view them in the Security & Compliance Center." -ForegroundColor Yellow
+                    }
+                }
+                
+                $purgeConfirm = Read-Host "Do you want to purge these items? This is a DESTRUCTIVE action. Type 'CONFIRM PURGE' to proceed"
+                if ($purgeConfirm -eq "CONFIRM PURGE") {
+                    $purgeAction = New-ComplianceSearchAction -SearchName $searchName -Purge -PurgeType HardDelete -Confirm:$false -ErrorAction Stop
+                    if ($purgeAction) {
+                        Write-Log "Purge action initiated with ID: $($purgeAction.Identity)" -Level Info
+                        Write-Host "Purge action initiated. You can check the status with:" -ForegroundColor Yellow
+                        Write-Host "Get-ComplianceSearchAction -Identity `"$($purgeAction.Identity)`"" -ForegroundColor Cyan
+                    } else {
+                        Write-Log "Failed to initiate purge action." -Level Error
+                    }
                 } else {
-                    Write-Log "Failed to initiate purge action." -Level Error
+                    Write-Log "Purge action cancelled or confirmation text didn't match." -Level Info
                 }
             }
         } else {
