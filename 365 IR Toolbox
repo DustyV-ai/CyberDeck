@@ -51,33 +51,6 @@ function Write-Log {
     }
 }
 
-function Test-ExchangeConnection {
-    $connectedToSCC = Get-PSSession | Where-Object {$_.ComputerName -eq "ps.compliance.protection.outlook.com" -and $_.State -eq "Opened"}
-    if (-not $connectedToSCC) {
-        Write-Log "Not connected to Security & Compliance Center. Attempting to connect..." -Level Warning
-        try {
-            Connect-IPPSSession -ErrorAction Stop
-            Write-Log "Successfully connected to Security & Compliance Center." -Level Info
-        }
-        catch {
-            Write-Log "Failed to connect to Security & Compliance Center: $_" -Level Error
-            return $false
-        }
-    }
-    return $true
-}
-
-function New-UniqueSearchName {
-    param([string]$BaseName)
-    $searchName = $BaseName
-    $counter = 1
-    while (Get-ComplianceSearch -Identity $searchName -ErrorAction SilentlyContinue) {
-        $searchName = "${BaseName}_$counter"
-        $counter++
-    }
-    return $searchName
-}
-
 function Start-ComplianceSearch {
     param(
         [Parameter(Mandatory=$true)]
@@ -124,15 +97,15 @@ function Start-ComplianceSearch {
 
         Write-Log "Creating compliance search: $searchName" -Level Info
 
-        # Attempt to create the search with proper parameters
+        # Create the search with correct parameters
         $retryCount = 0
         $maxRetries = $script:MaxRetries
         $success = $false
         
         do {
             try {
-                # Note the correct parameters: using quotes around "All" and proper parameter syntax
-                $search = New-ComplianceSearch -Name $searchName -AllMailboxes $true -ContentMatchQuery $searchQuery -ErrorAction Stop
+                # Fixed: Using correct parameter syntax for New-ComplianceSearch
+                $search = New-ComplianceSearch -Name $searchName -ExchangeLocation All -ContentMatchQuery $searchQuery -ErrorAction Stop
                 $success = $true
                 Write-Log "Successfully created compliance search" -Level Info
                 break
@@ -212,21 +185,31 @@ function Start-ComplianceSearch {
                 Write-Host "Items Found: $($results.Items)" -ForegroundColor Green
                 Write-Host "Size: $($results.Size)" -ForegroundColor Green
                 Write-Host "Status: $($results.Status)" -ForegroundColor Green
-                Write-Host "Locations: $($results.SearchStatistics)" -ForegroundColor Green
                 
                 # Offer to export detailed results
                 $exportChoice = Read-Host "Do you want to export detailed results to a CSV file? (Y/N)"
                 if ($exportChoice -eq "Y") {
-                    $exportPath = Join-Path -Path $env:USERPROFILE -ChildPath "Desktop\ComplianceSearchResults_$searchName.csv"
-                    
-                    # Use the Search-ComplianceSearch cmdlet to get detailed results
-                    # Note: This cmdlet might not be available in all environments
                     try {
-                        $detailedResults = New-ComplianceSearchAction -SearchName $searchName -Preview -ErrorAction Stop
-                        Start-Sleep -Seconds 5
-                        $previewResults = Get-ComplianceSearchAction -Identity "$searchName`_Preview" -ErrorAction Stop
-                        $previewResults | Export-Csv -Path $exportPath -NoTypeInformation
-                        Write-Host "Results exported to: $exportPath" -ForegroundColor Green
+                        Write-Log "Creating preview action for detailed results..." -Level Info
+                        # Fixed: Using -SearchName parameter for New-ComplianceSearchAction
+                        $previewAction = New-ComplianceSearchAction -SearchName $searchName -Preview -ErrorAction Stop
+                        
+                        # Wait for preview to complete
+                        $previewActionName = "$searchName" + "_Preview"
+                        Write-Log "Waiting for preview action to complete..." -Level Info
+                        
+                        do {
+                            Start-Sleep -Seconds 5
+                            $previewStatus = Get-ComplianceSearchAction -Identity $previewActionName -ErrorAction SilentlyContinue
+                        } while ($previewStatus -and $previewStatus.Status -ne "Completed")
+                        
+                        if ($previewStatus -and $previewStatus.Status -eq "Completed") {
+                            $exportPath = Join-Path -Path $env:USERPROFILE -ChildPath "Desktop\ComplianceSearchResults_$searchName.csv"
+                            $previewStatus.Results | Out-File -FilePath $exportPath -Encoding UTF8
+                            Write-Host "Results exported to: $exportPath" -ForegroundColor Green
+                        } else {
+                            Write-Log "Preview action did not complete successfully." -Level Warning
+                        }
                     }
                     catch {
                         Write-Log "Failed to export detailed results: $_" -Level Error
@@ -236,13 +219,22 @@ function Start-ComplianceSearch {
                 
                 $purgeConfirm = Read-Host "Do you want to purge these items? This is a DESTRUCTIVE action. Type 'CONFIRM PURGE' to proceed"
                 if ($purgeConfirm -eq "CONFIRM PURGE") {
-                    $purgeAction = New-ComplianceSearchAction -SearchName $searchName -Purge -PurgeType HardDelete -Confirm:$false -ErrorAction Stop
-                    if ($purgeAction) {
-                        Write-Log "Purge action initiated with ID: $($purgeAction.Identity)" -Level Info
-                        Write-Host "Purge action initiated. You can check the status with:" -ForegroundColor Yellow
-                        Write-Host "Get-ComplianceSearchAction -Identity `"$($purgeAction.Identity)`"" -ForegroundColor Cyan
-                    } else {
-                        Write-Log "Failed to initiate purge action." -Level Error
+                    try {
+                        Write-Log "Creating purge action..." -Level Info
+                        # Fixed: Using -SearchName parameter for New-ComplianceSearchAction
+                        $purgeAction = New-ComplianceSearchAction -SearchName $searchName -Purge -PurgeType HardDelete -Confirm:$false -ErrorAction Stop
+                        
+                        if ($purgeAction) {
+                            Write-Log "Purge action initiated with ID: $($purgeAction.Identity)" -Level Info
+                            Write-Host "Purge action initiated. You can check the status with:" -ForegroundColor Yellow
+                            Write-Host "Get-ComplianceSearchAction -Identity `"$($purgeAction.Identity)`"" -ForegroundColor Cyan
+                        } else {
+                            Write-Log "Failed to initiate purge action." -Level Error
+                        }
+                    }
+                    catch {
+                        Write-Log "Error creating purge action: $_" -Level Error
+                        Write-Host "Error creating purge action. Please check the Security & Compliance Center for more details." -ForegroundColor Red
                     }
                 } else {
                     Write-Log "Purge action cancelled or confirmation text didn't match." -Level Info
@@ -260,11 +252,73 @@ function Start-ComplianceSearch {
 
 function Remove-OldSearches {
     param([int]$DaysOld = 30)
-    $cutoffDate = (Get-Date).AddDays(-$DaysOld)
-    $oldSearches = Get-ComplianceSearch | Where-Object { $_.CreationTime -lt $cutoffDate }  # Use CreationTime instead of CreatedDate
-    foreach ($search in $oldSearches) {
-        Write-Log "Removing old search: $($search.Name)" -Level Info
-        Remove-ComplianceSearch -Identity $search.Name -Confirm:$false  # Use -Identity instead of -Name
+    
+    try {
+        if (-not (Test-ExchangeConnection)) {
+            throw "Unable to establish connection to Security & Compliance Center."
+        }
+        
+        $cutoffDate = (Get-Date).AddDays(-$DaysOld)
+        Write-Log "Looking for searches older than $cutoffDate" -Level Info
+        
+        # Fixed: Using proper property name and error handling
+        $allSearches = Get-ComplianceSearch -ErrorAction Stop
+        $oldSearches = $allSearches | Where-Object { 
+            $_.CreatedTime -lt $cutoffDate -or 
+            ($_.CreationTime -and $_.CreationTime -lt $cutoffDate)
+        }
+        
+        if ($oldSearches) {
+            Write-Log "Found $($oldSearches.Count) old searches to remove" -Level Info
+            
+            foreach ($search in $oldSearches) {
+                try {
+                    Write-Log "Removing old search: $($search.Name)" -Level Info
+                    # Fixed: Using -Identity parameter
+                    Remove-ComplianceSearch -Identity $search.Name -Confirm:$false -ErrorAction Stop
+                    Write-Log "Successfully removed search: $($search.Name)" -Level Info
+                }
+                catch {
+                    Write-Log "Failed to remove search $($search.Name): $_" -Level Error
+                }
+            }
+        } else {
+            Write-Log "No old searches found to remove" -Level Info
+        }
+    }
+    catch {
+        Write-Log "Error in Remove-OldSearches: $_" -Level Error
+    }
+}
+
+function Test-ExchangeConnection {
+    try {
+        # Check for Security & Compliance Center connection
+        $sccSession = Get-PSSession | Where-Object {
+            $_.ComputerName -eq "ps.compliance.protection.outlook.com" -and 
+            $_.State -eq "Opened" -and
+            $_.ConfigurationName -eq "Microsoft.Exchange"
+        }
+        
+        if (-not $sccSession) {
+            Write-Log "Not connected to Security & Compliance Center. Attempting to connect..." -Level Warning
+            try {
+                Connect-IPPSSession -ErrorAction Stop
+                Write-Log "Successfully connected to Security & Compliance Center." -Level Info
+                return $true
+            }
+            catch {
+                Write-Log "Failed to connect to Security & Compliance Center: $_" -Level Error
+                return $false
+            }
+        } else {
+            Write-Log "Already connected to Security & Compliance Center." -Level Info
+            return $true
+        }
+    }
+    catch {
+        Write-Log "Error checking Exchange connection: $_" -Level Error
+        return $false
     }
 }
 
